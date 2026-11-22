@@ -1,6 +1,7 @@
 """Build pilot VV/VH arrays on the YieldSAT grid from public Sentinel-1 RTC COGs."""
 
 import argparse
+import csv
 from collections import defaultdict
 from concurrent.futures import as_completed, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,10 @@ API = "https://planetarycomputer.microsoft.com/api"
 COLLECTION = "sentinel-1-rtc"
 TOKENS = {}
 TOKEN_LOCK = Lock()
+
+
+class CoverageError(ValueError):
+    pass
 
 
 def get_json(url):
@@ -56,12 +61,15 @@ def sign_asset(href):
 
 
 def search(bounds, sow, harvest):
-    params = {"bbox": ",".join(map(str, bounds)), "limit": 100,
+    params = {"collections": COLLECTION, "bbox": ",".join(map(str, bounds)), "limit": 100,
               "datetime": f"{sow}T00:00:00Z/{harvest}T23:59:59Z"}
-    url = f"{API}/stac/v1/collections/{COLLECTION}/items?{urlencode(params)}"
+    url = f"{API}/stac/v1/search?{urlencode(params)}"
     while url:
         page = get_json(url)
-        yield from page["features"]
+        for item in page["features"]:
+            date = np.datetime64(item["properties"]["datetime"][:10])
+            if sow <= date <= harvest:
+                yield item
         url = next((link["href"] for link in page["links"] if link["rel"] == "next"), None)
 
 
@@ -78,11 +86,13 @@ def read_backscatter(item, grid):
     return np.stack(channels).astype(np.float32)
 
 
-def build(field):
+def build(field, min_slots=1):
     radar_file = field / "sar.npy"
     provenance_file = field / "sar_sources.json"
     if radar_file.is_file() and provenance_file.is_file():
-        return field.name, "already built"
+        existing = json.loads(provenance_file.read_text(encoding="utf-8"))
+        if existing.get("catalog") == "stac-search" and len(existing["slots"]) >= min_slots:
+            return len(existing["slots"]), "already built"
     meta = json.loads((field / "meta.json").read_text(encoding="utf-8"))
     sow, harvest = [np.datetime64(datetime.strptime(meta[name], "%d.%m.%Y").date())
                     for name in ("seeding_date", "harvesting_date")]
@@ -103,60 +113,109 @@ def build(field):
             date = np.datetime64(p["datetime"][:10])
             groups[orbit].append((date, item))
     if not groups:
-        raise ValueError(f"No dual-polarization RTC items for {field.name}")
-    orbit, scenes = max(sorted(groups.items()), key=lambda entry: len({d for d, _ in entry[1]}))
-    sources = []
-    cache = {}
+        raise CoverageError(f"No dual-polarization RTC items for {field.name}")
+    centers = {}
     for slot in np.flatnonzero(season):
         center = optical_dates[slot] if not np.isnat(optical_dates[slot]) else slot_dates[slot]
-        center = max(sow, min(harvest, center))
-        nearby = sorted(scenes, key=lambda pair: (abs(pair[0] - center), pair[1]["id"]))
-        for date, scene in nearby:
-            days = int((date - center) / np.timedelta64(1, "D"))
-            if abs(days) > 12:
+        centers[int(slot)] = max(sow, min(harvest, center))
+
+    def candidate_count(scenes):
+        limit = np.timedelta64(12, "D")
+        return sum(any(abs(date - center) <= limit for date, _ in scenes)
+                   for center in centers.values())
+
+    best = 0
+    for orbit, scenes in sorted(groups.items(), key=lambda item: (-candidate_count(item[1]), item[0])):
+        if candidate_count(scenes) < min_slots:
+            continue
+        sources = []
+        cache = {}
+        data.fill(np.nan)
+        for slot, center in centers.items():
+            nearby = sorted(scenes, key=lambda pair: (abs(pair[0] - center), pair[1]["id"]))
+            for date, scene in nearby:
+                days = int((date - center) / np.timedelta64(1, "D"))
+                if abs(days) > 12:
+                    break
+                if scene["id"] not in cache:
+                    power = read_backscatter(scene, grid)
+                    power[~np.isfinite(power) | (power <= 0)] = np.nan
+                    cache[scene["id"]] = power
+                power = cache[scene["id"]]
+                coverage = np.isfinite(power[:, support]).all(axis=0).mean()
+                if coverage < 0.95:
+                    continue
+                data[slot] = power
+                sources.append(dict(slot=slot, target_date=str(center), date=str(date),
+                                    item=scene["id"], labeled_coverage=float(coverage)))
                 break
-            if scene["id"] not in cache:
-                power = read_backscatter(scene, grid)
-                power[~np.isfinite(power) | (power <= 0)] = np.nan
-                cache[scene["id"]] = power
-            power = cache[scene["id"]]
-            coverage = np.isfinite(power[:,support]).all(axis=0).mean()
-            if coverage < 0.95:
-                continue
-            data[slot] = power
-            sources.append(dict(slot=int(slot), target_date=str(center), date=str(date),
-                                item=scene["id"], labeled_coverage=float(coverage)))
+        if len(sources) >= min_slots:
             break
-    if not sources:
-        raise ValueError(f"No RTC slots with adequate coverage for {field.name}")
+        best = max(best, len(sources))
+    else:
+        raise CoverageError(f"Only {best} usable radar slots found; need {min_slots}")
     temp = field / "sar.partial.npy"
     np.save(temp, data)
     temp.replace(radar_file)
-    provenance = dict(collection=COLLECTION, units="linear backscatter power", orbit=orbit, slots=sources)
+    provenance = dict(collection=COLLECTION, catalog="stac-search", units="linear backscatter power", orbit=orbit, slots=sources)
     provenance_file.write_text(json.dumps(provenance, indent=2), encoding="utf-8")
-    return field.name, f"{len(sources)} radar slots on orbit {orbit}"
+    return len(sources), f"orbit {orbit}"
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npy", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--country", help="limit coverage checks to one country")
+    parser.add_argument("--field", action="append", help="process only these exact field IDs")
+    parser.add_argument("--min-slots", type=int, default=1)
+    parser.add_argument("--status-csv", type=Path)
     args = parser.parse_args()
-    fields = sorted(p.parent for p in args.npy.glob("*/*/meta.json"))
+    if not 1 <= args.min_slots <= 24:
+        parser.error("--min-slots must be between 1 and 24")
+    if args.workers < 1:
+        parser.error("--workers must be positive")
+    fields = sorted(p.parent for p in args.npy.glob("*/*/meta.json")
+                    if (args.country is None or p.parent.parent.name == args.country)
+                    and (args.field is None or p.parent.name in args.field))
     if not fields:
         parser.error("No exported field inputs")
-    failures = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        jobs = {pool.submit(build, field): field.name for field in fields}
-        for job in as_completed(jobs):
-            try:
-                field, status = job.result()
-                print(f"{field}: {status}", flush=True)
-            except (ValueError, RuntimeError) as exc:
-                failures += 1
-                print(f"{jobs[job]}: {exc}", flush=True)
-    if failures:
-        parser.exit(1, f"{failures}/{len(fields)} fields failed.\n")
+    if args.field and set(args.field) != {p.name for p in fields}:
+        parser.error("Some requested fields were not found")
+
+    def run(writer=None, report=None):
+        counts = {"ready": 0, "coverage": 0, "failed": 0}
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            jobs = {pool.submit(build, field, args.min_slots): field for field in fields}
+            for job in as_completed(jobs):
+                field = jobs[job]
+                slots = 0
+                try:
+                    slots, detail = job.result()
+                    status = "ready"
+                except CoverageError as exc:
+                    status, detail = "coverage", str(exc)
+                except Exception as exc:
+                    status, detail = "failed", str(exc)
+                counts[status] += 1
+                print(f"{field.name}: {status} ({slots} slots) {detail}", flush=True)
+                if writer:
+                    writer.writerow(dict(country=field.parent.name, field=field.name,
+                                         status=status, radar_slots=slots, detail=detail))
+                    report.flush()
+        print(counts, flush=True)
+        return counts["failed"]
+
+    if args.status_csv:
+        with args.status_csv.open("w", newline="", encoding="utf-8") as report:
+            writer = csv.DictWriter(report, fieldnames=("country", "field", "status", "radar_slots", "detail"))
+            writer.writeheader()
+            failed = run(writer, report)
+    else:
+        failed = run()
+    if failed:
+        parser.exit(1)
+
 
 
 if __name__ == "__main__":

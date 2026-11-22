@@ -3,6 +3,8 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 import numpy as np
 import rasterio
@@ -10,6 +12,8 @@ from rasterio.transform import from_origin
 import torch
 
 from build_sar_npy import load_s1
+from export_yieldsat_fields import same_pixel_indices
+from fetch_sar_rtc import search
 from split_fields import AFF_FILES, load_split, require_fresh, write_manifest
 from train_aff import FieldData, MirandaFeatureFusion, compute_norm
 from train_fusion import FusionNet
@@ -75,6 +79,31 @@ class PilotTests(unittest.TestCase):
         fused = MirandaFeatureFusion(use_sar=True)
         for name, value in optical.state_dict().items():
             torch.testing.assert_close(value, fused.state_dict()[name])
+
+    def test_label_grid_allows_subpixel_rounding_but_rejects_shift(self):
+        optical = SimpleNamespace(shape=(45, 94), height=45, width=94, crs="EPSG:32633",
+                                  transform=from_origin(409504.30, 5929829.01, 10, 10))
+        labels = SimpleNamespace(shape=optical.shape, crs=optical.crs,
+                                 transform=from_origin(409504.18, 5929829.18, 9.9894, 9.9894))
+        self.assertTrue(same_pixel_indices(optical, labels))
+        labels.transform = from_origin(409504.30, 5929839.01, 10, 10)
+        self.assertFalse(same_pixel_indices(optical, labels))
+
+    def test_catalog_search_paginates_and_rejects_out_of_season_items(self):
+        def item(date):
+            return {"properties": {"datetime": date + "T12:00:00Z"}}
+
+        pages = [
+            {"features": [item("2016-08-01"), item("2016-09-19")],
+             "links": [{"rel": "next", "href": "https://example.org/next"}]},
+            {"features": [item("2017-08-24"), item("2017-08-25")], "links": []},
+        ]
+        with patch("fetch_sar_rtc.get_json", side_effect=pages) as get:
+            results = list(search((13.72, 53.50, 13.74, 53.51),
+                                  np.datetime64("2016-09-19"), np.datetime64("2017-08-24")))
+        self.assertEqual(results, [item("2016-09-19"), item("2017-08-24")])
+        self.assertIn("/stac/v1/search?", get.call_args_list[0].args[0])
+        self.assertEqual(get.call_args_list[1].args[0], "https://example.org/next")
 
     def test_radar_window_uses_target_grid(self):
         with TemporaryDirectory() as folder:

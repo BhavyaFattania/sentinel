@@ -4,12 +4,14 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import netCDF4
 import numpy as np
 import rasterio
 
 from export_extra_bands import WEATHER, DEM, COORD, PROPS
+from split_fields import AFF_FILES
 
 S2 = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09", "B11", "B12", "B8A"]
 SOIL = [f"{prop}_{depth}" for prop in PROPS for depth in ("0-5", "5-15", "15-30")]
@@ -33,22 +35,42 @@ def field_dates(ds, idx):
     return dates
 
 
+def same_pixel_indices(reference, labels):
+    if reference.shape != labels.shape or reference.crs != labels.crs:
+        return False
+    mapping = ~labels.transform * reference.transform
+    # Grid transforms can differ slightly after yield-map preprocessing.
+    # Every optical pixel centre must still fall in the same label pixel.
+    for x in (0.5, reference.width - 0.5):
+        for y in (0.5, reference.height - 0.5):
+            lx, ly = mapping * (x, y)
+            if abs(lx - x) >= 0.5 or abs(ly - y) >= 0.5:
+                return False
+    return True
+
+
 def export_field(ds, idx, band_indices, raw, destination, meta):
-    reference = next(iter(sorted((raw / "s2_images").glob("*.tif"))))
     yield_ref = next(iter(sorted((raw / "yield_masks").glob("mean*.tif"))))
-    with rasterio.open(reference) as src, rasterio.open(yield_ref) as labels:
-        shape = src.shape
-        if (shape, src.crs, src.transform) != (labels.shape, labels.crs, labels.transform):
-            raise ValueError(f"Optical and yield grids differ for {raw.name}")
+    with rasterio.open(yield_ref) as labels:
+        for reference in sorted((raw / "s2_images").glob("*.tif")):
+            with rasterio.open(reference) as src:
+                if same_pixel_indices(src, labels):
+                    shape = src.shape
+                    break
+        else:
+            raise ValueError(f"No optical raster shares yield pixel indices for {raw.name}")
         target = labels.read(1, masked=True).filled(np.nan)
     rows = ds["row"][idx].astype(np.intp)
     cols = ds["col"][idx].astype(np.intp)
     y = as_float(ds["target"][idx])
     if len(np.unique(rows * shape[1] + cols)) != len(rows):
         raise ValueError(f"Duplicate pixel indices for {raw.name}")
-    if not np.allclose(target[rows, cols], y, equal_nan=True):
+    raw_y = target[rows, cols]
+    valid = np.isfinite(y) & np.isfinite(raw_y)
+    if not valid.any() or not np.allclose(raw_y[valid], y[valid]):
         raise ValueError(f"NetCDF targets disagree with the raw yield raster for {raw.name}")
-
+    dropped = int((np.isfinite(y) & ~valid).sum())
+    y[~valid] = np.nan
     x = as_float(ds["sample"][idx, :, band_indices])
     dates = field_dates(ds, idx)
     t = x.shape[1]
@@ -72,7 +94,7 @@ def export_field(ds, idx, band_indices, raw, destination, meta):
     ymap = np.full(shape, np.nan, np.float32)
     ymap[rows, cols] = y
     mask = np.zeros(shape, bool)
-    mask[rows, cols] = True
+    mask[rows, cols] = valid
     # A slot centre is distinct from the selected optical acquisition date.
     harvest_year = int(meta["year"])
     start = np.datetime64(f"{harvest_year - 1}-01", "M")
@@ -89,6 +111,7 @@ def export_field(ds, idx, band_indices, raw, destination, meta):
                             dates=dates, slot_dates=centers, season=season, mask=mask, yield_=ymap).items():
         np.save(destination / ("yield.npy" if name == "yield_" else f"{name}.npy"), array)
     meta["s2_reference"] = str(reference.resolve())
+    meta["yield_pixels_excluded_raw_nodata"] = dropped
     meta["bands"] = dict(s2=S2, weather=WEATHER, dem=DEM, soil=SOIL, coord=COORD)
     (destination / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"{raw.name}: {shape}, labeled={np.isfinite(y).sum()}, optical dates={(~np.isnat(dates)).sum()}", flush=True)
@@ -102,6 +125,7 @@ def main():
     parser.add_argument("--crop")
     parser.add_argument("--year", type=int)
     parser.add_argument("--max-fields", type=int)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     country = args.nc.parent.name
     with netCDF4.Dataset(args.nc) as ds:
@@ -115,7 +139,7 @@ def main():
         codes = np.asarray(field[:])
         order = np.argsort(codes, kind="stable")
         bounds = np.r_[0, np.flatnonzero(np.diff(codes[order])) + 1, len(order)]
-        done = 0
+        done = failed = 0
         for start, end in zip(bounds[:-1], bounds[1:]):
             idx = order[start:end]
             name = field.getncattr(str(int(codes[idx[0]])))
@@ -124,18 +148,31 @@ def main():
                 continue
             if args.year and not name.endswith(f"_{args.year}"):
                 continue
-            metadata = raw / f"metadata-{name}.json"
-            meta = json.loads(metadata.read_text(encoding="utf-8"))
             dest = args.out / country / name
             if dest.exists():
-                raise FileExistsError(f"Use a fresh output directory: {dest}")
-            selection = slice(int(idx[0]), int(idx[-1]) + 1) if idx[-1] - idx[0] + 1 == len(idx) else idx
-            export_field(ds, selection, band_indices, raw, dest, meta)
+                required = AFF_FILES + ("dates.npy", "slot_dates.npy", "season.npy", "meta.json")
+                if not args.resume or not all((dest / file).is_file() for file in required):
+                    raise FileExistsError(f"Unexpected existing field directory: {dest}")
+            else:
+                try:
+                    metadata = raw / f"metadata-{name}.json"
+                    meta = json.loads(metadata.read_text(encoding="utf-8"))
+                    selection = slice(int(idx[0]), int(idx[-1]) + 1) if idx[-1] - idx[0] + 1 == len(idx) else idx
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with TemporaryDirectory(prefix=".field-", dir=dest.parent) as tmp:
+                        staged = Path(tmp) / name
+                        export_field(ds, selection, band_indices, raw, staged, meta)
+                        staged.rename(dest)
+                except (OSError, ValueError, IndexError, StopIteration) as exc:
+                    failed += 1
+                    print(f"{name}: export failed ({type(exc).__name__}: {exc})", flush=True)
+                    continue
             done += 1
             if args.max_fields is not None and done >= args.max_fields:
                 break
-    if not done:
-        parser.error("No matching fields")
+    print(f"{country}: {done} complete fields, {failed} failures", flush=True)
+    if not done or failed:
+        parser.exit(1)
 
 
 if __name__ == "__main__":
