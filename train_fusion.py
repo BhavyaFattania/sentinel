@@ -16,6 +16,7 @@ python train_fusion.py --npy npy --split-dir splits --mode fused --accum 16   # 
 """
 import os, csv, glob, json, argparse, random
 import numpy as np, torch, torch.nn as nn
+from split_fields import SPLITS, field_ids, load_split
 
 class ConvLSTMCell(nn.Module):
     def __init__(s, cin, ch, k=3):
@@ -44,10 +45,14 @@ class FusionNet(nn.Module):
         s.gate = nn.Conv2d(2 * ch + 2, ch, 1)
         s.head = nn.Sequential(nn.Linear(T * ch, 128), nn.ReLU(), nn.Dropout(0.2), nn.Linear(128, 1))
     def fuse(s, s2, sar, v2, vs, mask=None):           # -> fused features (T,ch,H,W), gate (T,ch,H,W) or None
-        f2, fs = s.enc_s2(s2), s.enc_sar(sar); g = None
-        if s.mode == "s2": f = f2
-        elif s.mode == "sar": f = fs
+        g = None
+        if s.mode == "s2":
+            f, valid = s.enc_s2(s2), v2
+        elif s.mode == "sar":
+            f, valid = s.enc_sar(sar), vs
         else:
+            f2, fs = s.enc_s2(s2), s.enc_sar(sar)
+            valid = v2 + vs
             g = torch.sigmoid(s.gate(torch.cat([f2, fs, v2, vs], 1)))
             if s.rule and mask is not None:
                 mf = mask.float()
@@ -58,7 +63,7 @@ class FusionNet(nn.Module):
                 g = g * v2                                                     # unusable optical pixel -> SAR only
                 g = torch.where((vs == 0) & (v2 > 0), torch.ones_like(g), g)   # no SAR at pixel -> optical only
             f = g * f2 + (1 - g) * fs
-        act = ((v2 + vs).flatten(1).amax(1) > 0).float()   # slot has any valid data (out-of-season -> 0)
+        act = (valid.flatten(1).amax(1) > 0).float()   # slot has any valid data (out-of-season -> 0)
         return f * act[:, None, None, None], g
     def forward(s, s2, sar, v2, vs, mask):  # s2 (T,12,H,W) sar (T,2,H,W) v* (T,1,H,W) mask (1,H,W)
         f, _ = s.fuse(s2, sar, v2, vs, mask)
@@ -149,8 +154,7 @@ def main():
     tr, va, te = [], [], []
     dirs = [d for d in glob.glob(os.path.join(a.npy, "*", "*")) if ok(d)] if not a.split_dir else []
     if a.split_dir:
-        g = lambda s: sorted(d for d in glob.glob(os.path.join(a.split_dir, s, "*", "*")) if ok(d))
-        tr, va, te = g("train"), g("val"), g("test")
+        tr, va, te = load_split(a.split_dir, ("s2.npy", "sar.npy", "yield.npy", "mask.npy"))
         if a.max_fields: tr, va, te = tr[:a.max_fields], va[:a.max_fields], te[:a.max_fields]
     elif a.max_fields: dirs = dirs[:a.max_fields]
     for c in ([] if a.split_dir else sorted({d.split(os.sep)[-2] for d in dirs})):          # per-country random split by field
@@ -208,7 +212,8 @@ def main():
     csv.writer(open(os.path.join(a.out, f"preds_{a.mode}.csv"), "w", newline="")).writerows(
         [["field", "actual", "pred"]] + [[n, round(float(y), 4), round(float(p), 4)] for n, y, p in zip(names, Y, P)])
     base = float(np.sqrt(np.mean((Y - st.gy[0]) ** 2)))     # RMSE of predicting the train-mean yield
-    res = dict(mode=a.mode, epochs_run=len(hist), val_best_rmse=best, test=tm, baseline_rmse=base)
+    res = dict(mode=a.mode, epochs_run=len(hist), val_best_rmse=best, test=tm, baseline_rmse=base,
+               field_ids={name: field_ids(paths) for name, paths in zip(SPLITS, (tr, va, te))})
     print("TEST:", res["test"]); json.dump(res, open(os.path.join(a.out, f"results_{a.mode}.json"), "w"), indent=2)
 
 if __name__ == "__main__":

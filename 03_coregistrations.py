@@ -132,7 +132,7 @@ def apply_shift_and_write(s1_path, out_path, shift_y, shift_x):
         transform = src.transform
 
     # Shift is in pixels; convert to a translated affine transform.
-    corrected_transform = transform * Affine.translation(-shift_x, -shift_y)
+    corrected_transform = transform * Affine.translation(shift_x, shift_y)
     profile.update(transform=corrected_transform)
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

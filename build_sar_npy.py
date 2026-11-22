@@ -2,14 +2,14 @@
 build_sar_npy.py - for each field in <npy>/<country>/<field>/, build sar.npy (24,2,H,W)
 = Gaussian-weighted (sigma days) composite of ALL that field's co-registered S1 images,
 centred on each of the 24 slot dates in dates.npy. NaN where no SAR contributes.
-Aligned to the npy grid via the field's raw S2 reference tif (coreg_pairs.csv), cropped/padded
-top-left to (H,W).
+Warped directly to the field's matching raw S2 reference grid from coreg_pairs.csv.
 
 python build_sar_npy.py --npy npy --pairs YieldSAT_Project/data/coreg_pairs.csv --log YieldSAT_Project/data/local_export_log.csv --map "F:\\YieldSAT_Project=$PWD/YieldSAT_Project" --map "F:\\Raw=$PWD/Raw" --max-fields 2
 """
 import os, re, glob, argparse, datetime as dt
+from pathlib import Path
 import numpy as np, pandas as pd, rasterio
-from rasterio.windows import from_bounds
+from rasterio.vrt import WarpedVRT
 from rasterio.enums import Resampling
 
 RE = re.compile(r"(\d{8})T\d{6}")
@@ -24,17 +24,12 @@ def s1_date(i):
     m = RE.search(str(i))
     return np.datetime64(dt.datetime.strptime(m.group(1), "%Y%m%d").date()) if m else None
 
-def load_s1(path, bounds, rh, rw, H, W):
-    with rasterio.open(path) as src:
-        win = from_bounds(*bounds, transform=src.transform)
-        a = src.read([1, 2], window=win, out_shape=(2, rh, rw), boundless=True,
-                     fill_value=np.nan, resampling=Resampling.nearest).astype(np.float32)
-        if src.nodata is not None:
-            a[a == src.nodata] = np.nan
-    out = np.full((2, H, W), np.nan, np.float32)
-    h, w = min(H, rh), min(W, rw)
-    out[:, :h, :w] = a[:, :h, :w]
-    return out
+def load_s1(path, grid):
+    with rasterio.open(path) as src, WarpedVRT(
+        src, **grid, dtype="float32", nodata=np.nan, resampling=Resampling.nearest
+    ) as aligned:
+        return aligned.read([1, 2], masked=True).filled(np.nan)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -45,7 +40,11 @@ def main():
     ap.add_argument("--name", default="sar.npy", help="output file name, e.g. sar_s3.npy for sigma=3")
     ap.add_argument("--map", action="append", default=[],
                     help='Windows=Linux prefix remap, repeatable, e.g. --map "F:\\YieldSAT_Project=/home/u/YieldSAT_Project" --map "F:\\Raw=/home/u/Raw"')
+    ap.add_argument("--path-column", default="local_path", help="column containing the TIFFs to use")
+    ap.add_argument("--input-db", action="store_true", help="combine GEE dB inputs in power before returning dB")
     a = ap.parse_args()
+    if not np.isfinite(a.sigma) or a.sigma <= 0:
+        ap.error("--sigma must be finite and positive")
 
     pairs = pd.read_csv(a.pairs).set_index("field_id")["s2_matched_path"].to_dict()
     log = pd.read_csv(a.log)
@@ -54,9 +53,10 @@ def main():
         for w, l in maps: p = remap(p, w, l)
         return p
     pairs = {k: rm(v) for k, v in pairs.items()}
-    log["local_path"] = log["local_path"].map(rm)
+    log = log.dropna(subset=[a.path_column]).copy()
+    log[a.path_column] = log[a.path_column].map(rm)
     log["d"] = log["image_id"].map(s1_date)
-    by_field = {f: g.dropna(subset=["d"]) for f, g in log.groupby("field_id")}
+    by_field = dict(tuple(log.dropna(subset=["d"]).groupby("field_id")))
 
     done = 0
     for d in sorted(glob.glob(os.path.join(a.npy, "*", "*"))):
@@ -66,22 +66,35 @@ def main():
             continue
         if f not in by_field or f not in pairs:
             print("skip (no SAR/ref):", f); continue
-        H, W = np.load(os.path.join(d, "mask.npy")).shape
-        slots = np.load(os.path.join(d, "dates.npy")).astype("datetime64[D]")
-        with rasterio.open(pairs[f]) as r:
-            bounds, rh, rw = r.bounds, r.height, r.width
-        if abs(rh - H) > 3 or abs(rw - W) > 3:
-            print(f"WARN {f}: ref grid {rh}x{rw} vs npy {H}x{W}")
+        field = Path(d)
+        shape = np.load(field / "mask.npy").shape
+        slots = np.load(field / "dates.npy").astype("datetime64[D]")
+        if (field / "slot_dates.npy").is_file():
+            slot_dates = np.load(field / "slot_dates.npy").astype("datetime64[D]")
+            slots = np.where(np.isnat(slots), slot_dates, slots)
+        if (field / "season.npy").is_file():
+            slots = np.where(np.load(field / "season.npy"), slots, np.datetime64("NaT", "D"))
+        with rasterio.open(pairs[f]) as ref:
+            if ref.shape != shape:
+                raise ValueError(f"{f}: reference shape {ref.shape} differs from exported mask {shape}")
+            grid = dict(crs=ref.crs, transform=ref.transform, height=ref.height, width=ref.width)
         g = by_field[f]
-        stack = np.stack([load_s1(p, bounds, rh, rw, H, W) for p in g["local_path"]])  # (N,2,H,W)
-        dd = g["d"].values.astype("datetime64[D]")
-        days = (slots[:, None] - dd[None, :]).astype(np.float32)          # (24,N)
-        Wt = np.exp(-0.5 * (days / a.sigma) ** 2).astype(np.float32)
-        valid = np.isfinite(stack).astype(np.float32)
-        num = np.einsum("tn,nchw->tchw", Wt, np.nan_to_num(stack))
-        den = np.einsum("tn,nchw->tchw", Wt, valid)
-        comp = np.where(den > 1e-6, num / np.maximum(den, 1e-6), np.nan).astype(np.float32)
-        np.save(out, comp)
+        stack = np.stack([load_s1(p, grid) for p in g[a.path_column]])
+        if a.input_db:
+            stack = np.power(10, stack / 10)
+        dates = g["d"].values.astype("datetime64[D]")
+        days = (slots[:, None] - dates[None, :]).astype(np.float32)
+        weights = np.exp(-0.5 * (days / a.sigma) ** 2).astype(np.float32)
+        weights[np.isnat(slots)] = 0
+        valid = np.isfinite(stack)
+        num = np.einsum("tn,nchw->tchw", weights, np.where(valid, stack, 0))
+        den = np.einsum("tn,nchw->tchw", weights, valid.astype(np.float32))
+        comp = np.divide(num, den, out=np.full(num.shape, np.nan, np.float32), where=den > 1e-6)
+        if a.input_db:
+            comp = 10 * np.log10(comp, where=comp > 0, out=np.full_like(comp, np.nan))
+        temp = field / (Path(out).name + ".partial.npy")
+        np.save(temp, comp)
+        temp.replace(out)
         done += 1
         print(f"[{done}] {f} sar {comp.shape} from {len(g)} images, nan={np.isnan(comp).mean():.3f}")
         if a.max_fields and done >= a.max_fields:

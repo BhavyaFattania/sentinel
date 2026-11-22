@@ -10,8 +10,9 @@ RMSE/R2 are reported (as in YieldSAT Table 13). Output files are run_folds.py co
 python train_aff.py --npy npy --split-dir folds/Argentina/fold_0 --mode s2 --out runs_aff/Argentina/fold_0
 python run_folds.py --npy npy --folds folds --runs runs_aff --trainer train_aff.py --countries Argentina
 """
-import os, re, csv, glob, json, math, argparse, random
+import os, re, csv, json, math, argparse, random
 import numpy as np, torch, torch.nn as nn
+from split_fields import AFF_FILES, SPLITS, field_ids, load_split
 
 
 # ================= BTech AFF code (cleaned; ImgBranch64 = AFFS2Branch64 with cin channels) =================
@@ -62,12 +63,13 @@ class LearnableQueryAttention(nn.Module):
 class MirandaFeatureFusion(nn.Module):
     def __init__(self, soil_ch=24, use_sar=False, drop=(), p=0.2):
         super().__init__(); d = set(drop)                      # drop = branches to remove (ablation)
-        self.s2 = None if "s2" in d else ImgBranch64(12, p); self.sar = ImgBranch64(2, p) if use_sar else None
+        self.s2 = None if "s2" in d else ImgBranch64(12, p)
         self.weather = None if "weather" in d else TemporalBranch64(4, p)
         self.dem = None if "dem" in d else SpatialBranch64(5, p)
         self.soil = None if "soil" in d else SpatialBranch64(soil_ch, p)
         self.coord = None if "coord" in d else SpatialBranch64(3, p)
         self.attn = LearnableQueryAttention(64, p); self.out = nn.Linear(64, 1)
+        self.sar = ImgBranch64(2, p) if use_sar else None
     def forward(self, s2_x, weather_x, topo_x, soil_x, coord_x, sar_x=None):
         reps = []
         if self.s2 is not None: reps.append(self.s2(s2_x))
@@ -99,7 +101,12 @@ def compute_norm(dirs, use_sar, sar_file, n_fields=120):
             s = acc.setdefault(g, [0, 0, 0]); s[0] = s[0] + z.sum(1); s[1] = s[1] + (z ** 2).sum(1); s[2] = s[2] + fin.sum(1)
     norm = {}
     for g, (s, ss, n) in acc.items():
-        m = s / np.maximum(n, 1); norm[g] = (m, np.sqrt(np.maximum(ss / np.maximum(n, 1) - m ** 2, 0)) + 1e-6)
+        m = s / np.maximum(n, 1)
+        sd = np.sqrt(np.maximum(ss / np.maximum(n, 1) - m ** 2, 0))
+        # Constant channels have no learned scale. Prevent division by an epsilon
+        # from amplifying small held-out departures into float16 overflow.
+        sd[sd <= 1e-6 * np.maximum(np.abs(m), 1)] = 1
+        norm[g] = m, sd
     y = np.concatenate(ys); return norm, (float(y.mean()), float(y.std()) + 1e-6)
 
 class FieldData:
@@ -109,10 +116,14 @@ class FieldData:
             a = f[g].astype(np.float32); bc = [1] * a.ndim; bc[CH_AX[g]] = -1
             a = (a - norm[g][0].astype(np.float32).reshape(bc)) / norm[g][1].astype(np.float32).reshape(bc)
             a = np.where(np.isfinite(a), a, fill).astype(np.float32)
-            if g in ("s2", "sar"): a = np.pad(a, ((0, 0), (0, 0), (2, 2), (2, 2)), mode="edge").astype(np.float16)
-            elif g in ("dem", "soil", "coord"): a = np.pad(a, ((0, 0), (2, 2), (2, 2)), mode="edge").astype(np.float16)
+            if g in ("s2", "sar", "dem", "soil", "coord"):
+                a = np.pad(a, ((0, 0),) * (a.ndim - 2) + ((2, 2), (2, 2)), mode="edge")
+                if np.abs(a).max() <= np.finfo(np.float16).max:
+                    a = a.astype(np.float16)
             setattr(self, g, a)
         ok = np.isfinite(f["y"]) & f["mask"]
+        if not ok.any():
+            raise ValueError(f"No finite yield targets in {d}")
         self.rc = np.argwhere(ok).astype(np.int64)
         self.ymap = np.where(ok, (np.nan_to_num(f["y"]) - ystat[0]) / ystat[1], 0.0).astype(np.float32)
         self.true_mean = float(f["y"][ok].mean())
@@ -143,11 +154,12 @@ def evaluate(model, fields, ystat, use_sar, dev, chunk=2048, want_pix=False):
             preds = []
             for i in range(0, len(fd.rc), chunk):
                 rc = fd.rc[i:i + chunk]
-                if len(rc) < 2: rc = fd.rc[max(0, len(fd.rc) - 2):]       # BatchNorm needs >= 2
                 b = make_batch([fd], [(0, r, c) for r, c in rc], use_sar, dev)
                 p = fwd(model, b).cpu().numpy()
-                preds.append(p if len(rc) == len(fd.rc[i:i + chunk]) else p[-1:])
+                preds.append(p)
             p = np.concatenate(preds) * ystat[1] + ystat[0]
+            if not np.isfinite(p).all():
+                raise FloatingPointError(f"Non-finite predictions for {fd.name}")
             ytrue = fd.ymap[fd.rc[:, 0], fd.rc[:, 1]] * ystat[1] + ystat[0]
             se += ((p - ytrue) ** 2).sum(); n += len(p)
             P.append(float(p.mean())); Y.append(fd.true_mean); N.append(fd.name)
@@ -195,10 +207,10 @@ def main():
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu"); use_sar = a.mode == "fused"
 
-    ok = lambda d: all(os.path.exists(os.path.join(d, n)) for n in (["weather.npy", "soil.npy"] + ([a.sar_file] if use_sar else [])))
-    g = lambda s: sorted(d for d in glob.glob(os.path.join(a.split_dir, s, "*", "*")) if ok(d))
-    tr_d, va_d, te_d = g("train"), g("val"), g("test")
+    required = AFF_FILES + ((a.sar_file,) if use_sar else ())
+    tr_d, va_d, te_d = load_split(a.split_dir, required)
     if a.max_fields: tr_d, va_d, te_d = tr_d[:a.max_fields], va_d[:a.max_fields], te_d[:a.max_fields]
+    used_fields = {name: field_ids(paths) for name, paths in zip(SPLITS, (tr_d, va_d, te_d))}
     print(f"fields train/val/test: {len(tr_d)}/{len(va_d)}/{len(te_d)} | {dev} | mode={a.mode} | sar_file={a.sar_file if use_sar else '-'}")
 
     norm, ystat = compute_norm(tr_d, use_sar, a.sar_file)
@@ -210,6 +222,8 @@ def main():
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3) if a.scheduler == "plateau" else None
 
     items = np.concatenate([np.column_stack([np.full(len(f.rc), i), f.rc]) for i, f in enumerate(tr)])
+    if min(len(items), a.batch, a.pixels_per_epoch) < 2:
+        ap.error("At least two training pixels are required per batch")
     os.makedirs(a.out, exist_ok=True); ck = os.path.join(a.out, f"best_{a.mode}.pt")
     csv_p = os.path.join(a.out, f"history_{a.mode}.csv"); png_p = os.path.join(a.out, f"curve_{a.mode}.png")
     if os.path.exists(csv_p): os.remove(csv_p)
@@ -245,7 +259,7 @@ def main():
     csv.writer(open(os.path.join(a.out, f"preds_{a.mode}.csv"), "w", newline="")).writerows(
         [["field", "actual", "pred"]] + [[n, round(float(y), 4), round(float(p), 4)] for n, y, p in zip(names, Y, P)])
     train_mean = float(np.mean([f.true_mean for f in tr]))
-    res = dict(mode=a.mode, epochs_run=len(hist), val_best_rmse=best, train=trm, val=vam, test=tm,
+    res = dict(mode=a.mode, epochs_run=len(hist), val_best_rmse=best, train=trm, val=vam, test=tm, field_ids=used_fields, device=str(dev),
                baseline_rmse=float(np.sqrt(np.mean((Y - train_mean) ** 2))), model="AFF-pixel", stop_metric=a.stop_metric, drop_branches=a.drop_branches, dropout=a.dropout, wd=a.wd, seed=a.seed, lr=a.lr, batch=a.batch, btech_config=a.btech_config, sar_file=a.sar_file if use_sar else None)
     print("TEST:", res["test"]); json.dump(res, open(os.path.join(a.out, f"results_{a.mode}.json"), "w"), indent=2)
 

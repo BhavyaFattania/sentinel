@@ -13,6 +13,7 @@ python make_splits.py --npy npy --out splits
 """
 import os, json, glob, shutil, random, argparse
 import pandas as pd
+from split_fields import require_fresh
 
 def link(src, dst, copy):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -27,6 +28,9 @@ def main():
     ap.add_argument("--eval-countries", nargs="+", default=["Argentina", "Brazil"])
     ap.add_argument("--seed", type=int, default=42); ap.add_argument("--copy", action="store_true")
     a = ap.parse_args()
+    require_fresh(a.out)
+    if set(a.train_countries) & set(a.eval_countries):
+        ap.error("Training and evaluation countries must be disjoint")
     rng = random.Random(a.seed); rows = []
 
     for d in sorted(glob.glob(os.path.join(a.npy, "*", "*"))):
@@ -34,6 +38,8 @@ def main():
         if not (os.path.exists(mp) and os.path.exists(os.path.join(d, "sar.npy"))): continue
         c, f = d.split(os.sep)[-2], d.split(os.sep)[-1]
         rows.append(dict(country=c, field=f, year=json.load(open(mp)).get("year"), path=d))
+    if not rows:
+        ap.error("No fields have metadata and sar.npy")
     df = pd.DataFrame(rows); df["split"] = ""
 
     df.loc[df.country.isin(a.train_countries), "split"] = "train"
@@ -43,6 +49,8 @@ def main():
         df.loc[idx[:nv], "split"] = "val"; df.loc[idx[nv:], "split"] = "test"
 
     df = df[df.split != ""]
+    if set(df["split"]) != {"train", "val", "test"}:
+        ap.error("No complete train/validation/test split can be made")
     for _, r in df.iterrows():
         link(r.path, os.path.join(a.out, r.split, r.country, r.field), a.copy)
     df.drop(columns="path").to_csv(os.path.join(a.out, "split_manifest.csv"), index=False)

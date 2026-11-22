@@ -1,8 +1,8 @@
 """
 02_speckle_filter_and_export.py
 
-Phase 2 — Multi-temporal speckle filtering (in GEE, before export).
-Phase 3 — Reproject to the Sentinel-2 grid and export GeoTIFFs.
+Phase 2 â€” Multi-temporal speckle filtering (in GEE, before export).
+Phase 3 â€” Reproject to the Sentinel-2 grid and export GeoTIFFs.
 
 For each field, builds an ee.ImageCollection from the images logged in
 gee_scene_log.csv, grouped by consistent geometry (relative orbit + pass
@@ -11,16 +11,16 @@ direction), applies a multi-temporal boxcar/mean-ratio speckle filter
 Sentinel-2 CRS/transform, and exports to Google Drive.
 
 You must supply the target S2 CRS + transform per field (read from one of
-your existing Sentinel-2 GeoTIFFs) — see `get_s2_grid()` below, which uses
+your existing Sentinel-2 GeoTIFFs) â€” see `get_s2_grid()` below, which uses
 rasterio to read that from a local file path per field.
 
 Usage:
-    python 02_speckle_filter_and_export.py --mt-window 5
+    python 02_speckle_filter_and_export.py --ee-project PROJECT --mt-window 5
 """
 
 import os
-import sys
 import time
+import math
 import csv
 import argparse
 import datetime as dt
@@ -29,15 +29,8 @@ import ee
 import pandas as pd
 import rasterio
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from utils.gee_utils import init_ee, s1_export_path
-
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-GEE_SCENE_LOG = os.path.join(DATA_DIR, "gee_scene_log.csv")
-FIELD_SCENE_MAP = os.path.join(DATA_DIR, "field_scene_map.csv")
 SUBMITTED_LOG = os.path.join(DATA_DIR, "submitted_exports.csv")
 
 
@@ -47,30 +40,35 @@ SUBMITTED_LOG = os.path.join(DATA_DIR, "submitted_exports.csv")
 def multitemporal_filter(collection, band, window=5):
     """
     Simple multi-temporal speckle filter (Quegan & Yu, 2001 style):
-    for each image, replace its value with (image / temporal_mean) *
-    local_spatial_mean_of_temporal_mean, i.e. use the temporally-stable
-    mean as the reference and a small spatial kernel to smooth the ratio.
+    divide each image by its local spatial mean, average those ratios across
+    acquisitions, and multiply by the local spatial mean of the target image.
+    Work in linear power, then return filtered backscatter in dB.
 
     This assumes `collection` already contains only images sharing
     consistent geometry (same relative orbit + pass direction) so the
     temporal mean is not corrupted by geometry-driven backscatter shifts.
     """
     kernel = ee.Kernel.square(radius=window // 2, units="pixels")
-    temporal_mean = collection.select(band).mean()
+    def _power_and_local_mean(img):
+        db = img.select(band)
+        power = db.multiply(math.log(10) / 10).exp()
+        mean = power.reduceNeighborhood(reducer=ee.Reducer.mean(), kernel=kernel)
+        return img.addBands(mean.rename("_local_mean")).addBands(power.divide(mean).rename("_ratio"))
+
+    normalized = collection.map(_power_and_local_mean)
+    temporal_ratio = normalized.select("_ratio").mean()
 
     def _filter_one(img):
-        ratio = img.select(band).divide(temporal_mean)
-        smoothed_ratio = ratio.reduceNeighborhood(
-            reducer=ee.Reducer.mean(), kernel=kernel
-        )
-        filtered = smoothed_ratio.multiply(temporal_mean).rename(band)
-        return img.addBands(filtered.rename(band + "_mtfilt"), overwrite=True)
+        db = img.select("_local_mean").multiply(temporal_ratio).log10().multiply(10)
+        return img.addBands(
+            db.rename(band + "_mtfilt"), overwrite=True
+        ).select(img.bandNames().remove("_local_mean").remove("_ratio").add(band + "_mtfilt"))
 
-    return collection.map(_filter_one)
+    return normalized.map(_filter_one)
 
 
 # ============================================================
-# Resumability — track what's already been submitted so a rerun
+# Resumability â€” track what's already been submitted so a rerun
 # (after a crash, a Ctrl+C, or hitting the queue cap) doesn't
 # resubmit duplicates.
 # ============================================================
@@ -103,7 +101,7 @@ from rasterio.warp import transform_bounds
 # ============================================================
 def get_s2_grid(s2_tif_path):
     """Return (crs_wkt, transform_list, width, height, bounds_wgs84) from a S2 GeoTIFF.
-    bounds_wgs84 is used to CLIP the export to this field's extent — without it,
+    bounds_wgs84 is used to CLIP the export to this field's extent â€” without it,
     exporting a reprojected full Sentinel-1 scene (~250km swath) instead of just
     the field produces multi-GB files instead of the expected ~100-200KB."""
     with rasterio.open(s2_tif_path) as src:
@@ -125,23 +123,23 @@ def wait_for_queue_capacity(threshold=2800, poll_interval_seconds=180):
     """
     Block until the number of active (READY/RUNNING) EE tasks drops below
     `threshold`. Prints the ACTUAL queue size each check, rather than
-    guessing blindly — this tells you directly whether the queue is
+    guessing blindly â€” this tells you directly whether the queue is
     genuinely draining or stuck, instead of leaving you to wonder.
 
     No timeout here on purpose: the correct response to a full queue is
-    always to keep waiting, not to give up — GEE will eventually work
+    always to keep waiting, not to give up â€” GEE will eventually work
     through it (it may just take a while for a large backlog).
     """
     while True:
         try:
             active = count_active_tasks()
         except Exception as e:
-            print(f"  (Couldn't check queue size: {e} — proceeding cautiously.)")
+            print(f"  (Couldn't check queue size: {e} â€” proceeding cautiously.)")
             return
         if active < threshold:
             return
         print(
-            f"  Queue at {active} active tasks (need < {threshold}) — "
+            f"  Queue at {active} active tasks (need < {threshold}) â€” "
             f"waiting {poll_interval_seconds}s and checking again... "
             f"[see https://code.earthengine.google.com/tasks]"
         )
@@ -150,26 +148,26 @@ def wait_for_queue_capacity(threshold=2800, poll_interval_seconds=180):
 
 def export_image(
     img, bands, field_id, image_id, country, crs_wkt, transform, bounds_wgs84, folder,
-    retry_wait_seconds=120,
+    retry_wait_seconds=120, submitted_log=SUBMITTED_LOG,
 ):
     """
     Export the given bands together as one multi-band GeoTIFF, reprojected
-    onto the S2 grid AND CLIPPED to the field's extent (bounds_wgs84) —
+    onto the S2 grid AND CLIPPED to the field's extent (bounds_wgs84) â€”
     without the clip, this exports the full ~250km Sentinel-1 scene instead
     of just the field, producing multi-gigabyte files instead of ~100-200KB.
 
     If Earth Engine's task queue is full ("Too many tasks already in the
-    queue"), this WAITS and RETRIES indefinitely instead of crashing — the
+    queue"), this WAITS and RETRIES indefinitely instead of crashing â€” the
     queue drains over time as GEE processes earlier tasks, so pausing and
     trying again is always the correct response here, never a fatal error.
-    Any other kind of error (bad CRS, missing asset, etc.) is NOT retried —
+    Any other kind of error (bad CRS, missing asset, etc.) is NOT retried â€”
     it's raised immediately since retrying won't fix it.
     """
     region = ee.Geometry.Rectangle(list(bounds_wgs84))
     projected = img.select(bands).clip(region).reproject(crs=crs_wkt, crsTransform=transform)
     # EE task 'description' has a hard 100-character limit (alnum, . , : ; _ - only).
     # The actual output filename (fileNamePrefix) has no such limit, so all the
-    # full identifying detail (country, field_id, image_id) stays there — the
+    # full identifying detail (country, field_id, image_id) stays there â€” the
     # description just needs to be short enough for the Tasks list.
     description = f"{field_id}_{image_id}"[:100]
     task = ee.batch.Export.image.toDrive(
@@ -188,19 +186,21 @@ def export_image(
         attempt += 1
         try:
             task.start()
-            log_submitted(field_id, image_id, task.id)
+            log_submitted(field_id, image_id, task.id, submitted_log)
             return task
         except ee.ee_exception.EEException as e:
             if "Too many tasks" in str(e):
-                print(f"  Queue full (attempt {attempt}) — checking real queue size...")
+                print(f"  Queue full (attempt {attempt}) â€” checking real queue size...")
                 wait_for_queue_capacity(poll_interval_seconds=retry_wait_seconds)
                 continue
-            raise  # a real error (bad CRS, missing asset, etc.) — don't retry, surface it
+            raise  # a real error (bad CRS, missing asset, etc.) â€” don't retry, surface it
 
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--ee-project", required=True, help="Earth Engine-enabled Google Cloud project")
+    parser.add_argument("--data-dir", default=DATA_DIR, help="directory containing the scene inventory CSVs")
     parser.add_argument("--mt-window", type=int, default=5, help="Speckle filter kernel size (pixels)")
     parser.add_argument("--drive-folder", type=str, default="YieldSAT_S1_exports")
     parser.add_argument(
@@ -217,18 +217,19 @@ def main():
     print("SPECKLE FILTER + EXPORT TO S2 GRID")
     print("=" * 60)
 
-    init_ee()
-    scene_log = pd.read_csv(GEE_SCENE_LOG)
-    field_scene_map = pd.read_csv(FIELD_SCENE_MAP)  # must include s2_grid_ref_path per field
+    ee.Initialize(project=args.ee_project)
+    scene_log = pd.read_csv(os.path.join(args.data_dir, "gee_scene_log.csv"))
+    field_scene_map = pd.read_csv(os.path.join(args.data_dir, "field_scene_map.csv"))
+    submitted_log = os.path.join(args.data_dir, "submitted_exports.csv")
 
-    already_submitted = load_submitted_set()
+    already_submitted = load_submitted_set(submitted_log)
     if already_submitted:
-        print(f"Resuming: {len(already_submitted)} image(s) already submitted in a previous run — will skip those.")
+        print(f"Resuming: {len(already_submitted)} image(s) already submitted in a previous run â€” will skip those.")
         print()
 
     print("Checking current Earth Engine queue size before starting...")
     wait_for_queue_capacity(threshold=2800, poll_interval_seconds=60)
-    print("Queue has capacity — starting submissions.")
+    print("Queue has capacity â€” starting submissions.")
     print()
 
     tasks_started = 0
@@ -291,6 +292,7 @@ def main():
                     transform=transform,
                     bounds_wgs84=bounds_wgs84,
                     folder=args.drive_folder,
+                    submitted_log=submitted_log,
                 )
                 tasks_started += 1
 

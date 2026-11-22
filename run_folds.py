@@ -1,88 +1,143 @@
-"""
-run_folds.py - train s2 (optical-only) and fused on every fold of every country, then summarise.
-Resumable: a (country, fold, mode) with runs/<country>/fold_<k>/results_<mode>.json is skipped.
-Summary: mean +/- std of TEST rmse / r2 per country and mode, plus paired Wilcoxon (s2 vs fused) on per-fold test RMSE.
+"""Train selected Sentinel yield models and compare matching held-out fields."""
 
-python run_folds.py --npy npy --folds folds --runs runs --modes s2 fused
-python run_folds.py --countries Germany --fold-ids 0 1 2     # subset / quick test
-python run_folds.py --summary-only
-"""
-import os, sys, json, glob, argparse, subprocess
-import numpy as np, pandas as pd
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import matplotlib
+import numpy as np
+import pandas as pd
 
-def plot_pred(runs, countries, modes):
-    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-    for c in countries:
-        fig, axs = plt.subplots(1, len(modes), figsize=(5.2 * len(modes), 5), squeeze=False)
-        for ax, m in zip(axs[0], modes):
-            fs = glob.glob(os.path.join(runs, c, "fold_*", f"preds_{m}.csv"))
-            if not fs: ax.set_title(f"{m}: no predictions"); continue
-            d = pd.concat([pd.read_csv(f) for f in fs])
-            err = d.pred - d.actual
-            rmse = float(np.sqrt((err ** 2).mean())); r2 = 1 - (err ** 2).sum() / ((d.actual - d.actual.mean()) ** 2).sum()
-            ax.scatter(d.actual, d.pred, s=14, alpha=0.6)
-            lo, hi = min(d.actual.min(), d.pred.min()), max(d.actual.max(), d.pred.max())
-            ax.plot([lo, hi], [lo, hi], "r--", label="1:1")
-            ax.set_xlabel("actual field yield (t/ha)"); ax.set_ylabel("predicted yield (t/ha)")
-            ax.set_title(f"{c} - {m}\nRMSE {rmse:.2f} t/ha, R2 {r2:.2f}, n={len(d)}"); ax.legend()
-        fig.tight_layout(); fig.savefig(os.path.join(runs, f"pred_vs_actual_{c}.png"), dpi=130); plt.close(fig)
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+def plot_predictions(root, predictions):
+    for country in sorted({key[0] for key in predictions}):
+        modes = sorted({key[2] for key in predictions if key[0] == country})
+        figure, axes = plt.subplots(1, len(modes), figsize=(5.2 * len(modes), 5), squeeze=False)
+        for axis, mode in zip(axes[0], modes):
+            data = pd.concat([data for (c, _, m), data in predictions.items() if (c, m) == (country, mode)])
+            lower = min(data.actual.min(), data.pred.min())
+            upper = max(data.actual.max(), data.pred.max())
+            axis.scatter(data.actual, data.pred, s=14, alpha=0.6)
+            axis.plot([lower, upper], [lower, upper], "r--")
+            axis.set(xlabel="Actual yield (t/ha)", ylabel="Predicted yield (t/ha)",
+                     title=f"{country} | {mode} | {len(data)} field predictions")
+        figure.tight_layout()
+        figure.savefig(root / f"pred_vs_actual_{country}.png", dpi=130)
+        plt.close(figure)
+
+
+def collect_fold(args, trainer, fold, out, extra):
+    config = dict(trainer=trainer.name, trainer_hash=hashlib.sha256(trainer.read_bytes()).hexdigest(),
+                  split=str(fold.resolve()), npy=str(args.npy.resolve()), extra=extra, accum=args.accum)
+    manifest = fold / "split_manifest.csv"
+    if manifest.is_file():
+        config["split_hash"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    config_path = out / "run_config.json"
+    if not args.summary_only:
+        if config_path.exists():
+            old = json.loads(config_path.read_text(encoding="utf-8"))
+            if config != old:
+                raise ValueError(f"{out} contains a different configuration. Use a new --runs directory.")
+        else:
+            if out.exists() and any(out.iterdir()):
+                raise ValueError(f"{out} already contains artifacts. Use a new --runs directory.")
+            out.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    runs, predictions = {}, {}
+    for mode in args.modes:
+        result = out / f"results_{mode}.json"
+        pred_file = out / f"preds_{mode}.csv"
+        if not args.summary_only and not (result.is_file() and pred_file.is_file()):
+            print(f"=== {fold.parent.name} {fold.name} mode {mode} ===", flush=True)
+            subprocess.run([sys.executable, "-B", str(trainer), "--npy", str(args.npy),
+                            "--split-dir", str(fold), "--mode", mode, "--accum", str(args.accum),
+                            "--out", str(out), *extra], check=True)
+        runs[mode] = json.loads(result.read_text(encoding="utf-8"))
+        if runs[mode]["mode"] != mode:
+            raise ValueError(f"Mode mismatch in {result}")
+        data = pd.read_csv(pred_file).sort_values("field").reset_index(drop=True)
+        if data.field.duplicated().any() or len(data) != runs[mode]["test"]["n"]:
+            raise ValueError(f"Invalid field predictions in {pred_file}")
+        if not np.isfinite(data[["actual", "pred"]].to_numpy()).all():
+            raise ValueError(f"Non-finite predictions in {pred_file}")
+        predictions[mode] = data
+    if "s2" in runs and "fused" in runs:
+        if runs["s2"].get("field_ids") != runs["fused"].get("field_ids"):
+            raise ValueError(f"The two modes used different split fields in {fold}")
+        columns = ["field", "actual"]
+        if not predictions["s2"][columns].equals(predictions["fused"][columns]):
+            raise ValueError(f"The two modes used different test labels in {fold}")
+    return runs, predictions
+
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--npy", default="npy"); ap.add_argument("--folds", default="folds"); ap.add_argument("--runs", default="runs")
-    ap.add_argument("--modes", nargs="+", default=["s2", "fused"]); ap.add_argument("--countries", nargs="+", default=None)
-    ap.add_argument("--fold-ids", nargs="+", type=int, default=None); ap.add_argument("--accum", type=int, default=16)
-    ap.add_argument("--summary-only", action="store_true")
-    ap.add_argument("--extra", default="", help='extra args for the trainer, e.g. --extra "--gate-rule off --tdrop 0"')
-    ap.add_argument("--trainer", default="train_fusion_v2.py", help="training script in the same folder")
-    a = ap.parse_args()
-    trainer = os.path.join(os.path.dirname(os.path.abspath(__file__)), a.trainer)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--npy", type=Path, default=Path("npy"))
+    parser.add_argument("--folds", type=Path, default=Path("folds"))
+    parser.add_argument("--runs", type=Path, default=Path("runs"))
+    parser.add_argument("--modes", nargs="+", default=["s2", "fused"])
+    parser.add_argument("--countries", nargs="+")
+    parser.add_argument("--fold-ids", nargs="+", type=int)
+    parser.add_argument("--accum", type=int, default=16)
+    parser.add_argument("--summary-only", action="store_true")
+    parser.add_argument("--extra", default="", help="extra quoted arguments for the trainer")
+    parser.add_argument("--trainer", default="train_aff.py")
+    args = parser.parse_args()
+    trainer = Path(__file__).resolve().with_name(args.trainer)
+    if not trainer.is_file():
+        parser.error(f"Trainer does not exist: {trainer}")
+    if len(set(args.modes)) != len(args.modes):
+        parser.error("Duplicate model modes")
+    if not args.folds.is_dir():
+        parser.error(f"Fold directory does not exist: {args.folds}")
+    extra = shlex.split(args.extra)
 
-    countries = a.countries or sorted(os.listdir(a.folds))
-    countries = [c for c in countries if os.path.isdir(os.path.join(a.folds, c))]
-    for c in countries:
-        ids = a.fold_ids if a.fold_ids is not None else sorted(int(x.split("_")[1]) for x in os.listdir(os.path.join(a.folds, c)))
+    countries = args.countries or sorted(d.name for d in args.folds.iterdir() if d.is_dir())
+    rows, all_predictions = [], {}
+    selected = []
+    for country in countries:
+        country_path = args.folds / country
+        if not country_path.is_dir():
+            parser.error(f"No folds for {country}")
+        ids = args.fold_ids if args.fold_ids is not None else sorted(
+            int(d.name.removeprefix("fold_")) for d in country_path.iterdir()
+            if d.is_dir() and re.fullmatch(r"fold_\d+", d.name))
         for k in ids:
-            for m in a.modes:
-                out = os.path.join(a.runs, c, f"fold_{k}")
-                if a.summary_only or os.path.exists(os.path.join(out, f"results_{m}.json")): continue
-                print(f"=== {c} fold {k} mode {m} ===", flush=True)
-                subprocess.run([sys.executable, trainer, "--npy", a.npy, "--split-dir", os.path.join(a.folds, c, f"fold_{k}"),
-                                "--mode", m, "--accum", str(a.accum), "--out", out] + a.extra.split(), check=False)
+            fold = country_path / f"fold_{k}"
+            if not fold.is_dir():
+                parser.error(f"Fold does not exist: {fold}")
+            selected.append((country, k, fold))
+    if not selected:
+        parser.error("No matching folds")
+    for country, k, fold in selected:
+        results, predictions = collect_fold(args, trainer, fold, args.runs / country / fold.name, extra)
+        for mode, result in results.items():
+            rows.append(dict(country=country, fold=k, mode=mode, epochs=result["epochs_run"],
+                             rmse=result["test"]["rmse"], r2=result["test"]["r2"], n_test=result["test"]["n"],
+                             baseline=result.get("baseline_rmse"),
+                             train_rmse=result.get("train", {}).get("rmse"), train_r2=result.get("train", {}).get("r2"),
+                             val_rmse=result.get("val", {}).get("rmse"), val_r2=result.get("val", {}).get("r2")))
+            all_predictions[country, k, mode] = predictions[mode]
+    summary = pd.DataFrame(rows).sort_values(["country", "mode", "fold"])
+    summary.to_csv(args.runs / "all_folds.csv", index=False)
+    print(summary.groupby(["country", "mode"])[["rmse", "r2"]].agg(["mean", "std", "count"]).round(3).to_string())
+    for country, grouped in summary.groupby("country"):
+        paired = grouped.pivot(index="fold", columns="mode", values="rmse")
+        if {"s2", "fused"} <= set(paired.columns):
+            differences = paired["s2"] - paired["fused"]
+            print(f"{country}: mean paired reduction {differences.mean():+.3f} t/ha, "
+                  f"fused wins {(differences > 0).sum()}/{len(differences)} folds")
+    plot_predictions(args.runs, all_predictions)
 
-    rows = []
-    for f in glob.glob(os.path.join(a.runs, "*", "fold_*", "results_*.json")):
-        r = json.load(open(f)); parts = f.split(os.sep)
-        rows.append(dict(country=parts[-3], fold=int(parts[-2].split("_")[1]), mode=r["mode"], epochs=r["epochs_run"],
-                         rmse=r["test"]["rmse"], r2=r["test"]["r2"], n_test=r["test"]["n"],
-                         baseline=r.get("baseline_rmse"),
-                         train_rmse=r.get("train", {}).get("rmse"), train_r2=r.get("train", {}).get("r2"),
-                         val_rmse=r.get("val", {}).get("rmse"), val_r2=r.get("val", {}).get("r2")))
-    if not rows: print("no results yet"); return
-    df = pd.DataFrame(rows).sort_values(["country", "mode", "fold"]); df.to_csv(os.path.join(a.runs, "all_folds.csv"), index=False)
-    print("\n" + df.groupby(["country", "mode"])[["rmse", "r2"]].agg(["mean", "std", "count"]).round(3).to_string())
-
-    if df["baseline"].notna().any():
-        b = df.dropna(subset=["baseline"]).drop_duplicates(["country", "fold"]).groupby("country")["baseline"].agg(["mean", "std", "count"]).round(3)
-        print("\nMean-baseline test RMSE (predict train-mean yield) - the model must beat this:"); print(b.to_string())
-    if df["train_rmse"].notna().any():
-        t = df.groupby(["country", "mode"])[["train_rmse", "val_rmse", "rmse", "train_r2", "val_r2", "r2"]].mean().round(3)
-        print("\nTrain / Val / Test, field level, mean over folds (best checkpoint):")
-        print(t.rename(columns={"rmse": "test_rmse", "r2": "test_r2"}).to_string())
-    plot_pred(a.runs, sorted(df.country.unique()), a.modes)
-
-    from scipy.stats import wilcoxon
-    print("\nPaired test on per-fold TEST RMSE (s2 vs fused, same folds):")
-    for c, g in df.groupby("country"):
-        p = g.pivot(index="fold", columns="mode", values="rmse").dropna()
-        if {"s2", "fused"} <= set(p.columns) and len(p) >= 3:
-            d = p["s2"] - p["fused"]                       # > 0 means fused better
-            try: pv = wilcoxon(p["s2"], p["fused"]).pvalue
-            except ValueError: pv = float("nan")
-            print(f"{c}: folds={len(p)} s2={p['s2'].mean():.3f} fused={p['fused'].mean():.3f} "
-                  f"gain={d.mean() / p['s2'].mean():+.1%} fused_wins={(d > 0).sum()}/{len(p)} p={pv:.4f}")
 
 if __name__ == "__main__":
     main()
