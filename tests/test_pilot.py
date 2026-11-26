@@ -50,9 +50,14 @@ class PilotTests(unittest.TestCase):
             for name, terrain in (("train", 0), ("val", 2)):
                 target = root / name
                 target.mkdir()
-                arrays = dict(s2=np.zeros((24, 12, 2, 2)), weather=np.zeros((24, 4)),
-                              dem=np.full((5, 2, 2), terrain), soil=np.zeros((24, 2, 2)),
-                              coord=np.zeros((3, 2, 2)), mask=np.ones((2, 2), bool))
+                arrays = dict(
+                    s2=np.zeros((24, 12, 2, 2)),
+                    weather=np.zeros((24, 4)),
+                    dem=np.full((5, 2, 2), terrain),
+                    soil=np.zeros((24, 2, 2)),
+                    coord=np.zeros((3, 2, 2)),
+                    mask=np.ones((2, 2), bool),
+                )
                 for key, value in arrays.items():
                     np.save(target / f"{key}.npy", value)
                 np.save(target / "yield.npy", np.array([[1, 2], [3, 4]], np.float32))
@@ -81,10 +86,18 @@ class PilotTests(unittest.TestCase):
             torch.testing.assert_close(value, fused.state_dict()[name])
 
     def test_label_grid_allows_subpixel_rounding_but_rejects_shift(self):
-        optical = SimpleNamespace(shape=(45, 94), height=45, width=94, crs="EPSG:32633",
-                                  transform=from_origin(409504.30, 5929829.01, 10, 10))
-        labels = SimpleNamespace(shape=optical.shape, crs=optical.crs,
-                                 transform=from_origin(409504.18, 5929829.18, 9.9894, 9.9894))
+        optical = SimpleNamespace(
+            shape=(45, 94),
+            height=45,
+            width=94,
+            crs="EPSG:32633",
+            transform=from_origin(409504.30, 5929829.01, 10, 10),
+        )
+        labels = SimpleNamespace(
+            shape=optical.shape,
+            crs=optical.crs,
+            transform=from_origin(409504.18, 5929829.18, 9.9894, 9.9894),
+        )
         self.assertTrue(same_pixel_indices(optical, labels))
         labels.transform = from_origin(409504.30, 5929839.01, 10, 10)
         self.assertFalse(same_pixel_indices(optical, labels))
@@ -94,13 +107,20 @@ class PilotTests(unittest.TestCase):
             return {"properties": {"datetime": date + "T12:00:00Z"}}
 
         pages = [
-            {"features": [item("2016-08-01"), item("2016-09-19")],
-             "links": [{"rel": "next", "href": "https://example.org/next"}]},
+            {
+                "features": [item("2016-08-01"), item("2016-09-19")],
+                "links": [{"rel": "next", "href": "https://example.org/next"}],
+            },
             {"features": [item("2017-08-24"), item("2017-08-25")], "links": []},
         ]
         with patch("fetch_sar_rtc.get_json", side_effect=pages) as get:
-            results = list(search((13.72, 53.50, 13.74, 53.51),
-                                  np.datetime64("2016-09-19"), np.datetime64("2017-08-24")))
+            results = list(
+                search(
+                    (13.72, 53.50, 13.74, 53.51),
+                    np.datetime64("2016-09-19"),
+                    np.datetime64("2017-08-24"),
+                )
+            )
         self.assertEqual(results, [item("2016-09-19"), item("2017-08-24")])
         self.assertIn("/stac/v1/search?", get.call_args_list[0].args[0])
         self.assertEqual(get.call_args_list[1].args[0], "https://example.org/next")
@@ -110,11 +130,27 @@ class PilotTests(unittest.TestCase):
             path = Path(folder) / "source.tif"
             transform = from_origin(500000, 9000000, 10, 10)
             source = np.arange(32, dtype=np.float32).reshape(2, 4, 4)
-            with rasterio.open(path, "w", driver="GTiff", crs="EPSG:32720", transform=transform,
-                               width=4, height=4, count=2, dtype="float32") as f:
+            with rasterio.open(
+                path,
+                "w",
+                driver="GTiff",
+                crs="EPSG:32720",
+                transform=transform,
+                width=4,
+                height=4,
+                count=2,
+                dtype="float32",
+            ) as f:
                 f.write(source)
-            out = load_s1(path, dict(crs="EPSG:32720", transform=from_origin(500010, 8999990, 10, 10),
-                                     width=2, height=2))
+            out = load_s1(
+                path,
+                dict(
+                    crs="EPSG:32720",
+                    transform=from_origin(500010, 8999990, 10, 10),
+                    width=2,
+                    height=2,
+                ),
+            )
             np.testing.assert_array_equal(out, source[:, 1:3, 1:3])
 
     def test_runner_propagates_trainer_failure(self):
@@ -122,9 +158,21 @@ class PilotTests(unittest.TestCase):
             root = Path(folder)
             (root / "folds" / "Argentina" / "fold_0").mkdir(parents=True)
             runner = Path(__file__).resolve().parents[1] / "run_folds.py"
-            result = subprocess.run([sys.executable, "-B", str(runner), "--folds", str(root / "folds"),
-                                     "--runs", str(root / "runs"), "--modes", "s2"],
-                                    capture_output=True, text=True)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(runner),
+                    "--folds",
+                    str(root / "folds"),
+                    "--runs",
+                    str(root / "runs"),
+                    "--modes",
+                    "s2",
+                ],
+                capture_output=True,
+                text=True,
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Empty train split", result.stderr)
             self.assertFalse((root / "runs" / "all_folds.csv").exists())

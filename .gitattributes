@@ -1,0 +1,3 @@
+*.py text eol=lf
+*.csv text eol=lf
+reproduction/reference/wheat-field-manifest.csv -text

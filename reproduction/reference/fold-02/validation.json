@@ -1,0 +1,28 @@
+{
+  "regions": [
+    "Argentina/DUP1/farm22",
+    "Argentina/DUP1/farm45",
+    "Brazil/DUP2/farm2"
+  ],
+  "selected": "aff_lstm1",
+  "arms": {
+    "aff_lstm2": {
+      "best_epoch": 3,
+      "val_macro_rmse": 1.5942435650736082,
+      "epochs": 6,
+      "seconds": 15.28
+    },
+    "aff_lstm1": {
+      "best_epoch": 1,
+      "val_macro_rmse": 1.4682469675973129,
+      "epochs": 5,
+      "seconds": 11.02
+    },
+    "aff_lstm1_valid_pool": {
+      "best_epoch": 3,
+      "val_macro_rmse": 1.5196664633959756,
+      "epochs": 6,
+      "seconds": 13.83
+    }
+  }
+}

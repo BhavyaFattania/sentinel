@@ -1,0 +1,6 @@
+{
+  "best_epoch": 1,
+  "val_macro_rmse": 0.31605143278643216,
+  "epochs": 5,
+  "seconds": 6.67
+}

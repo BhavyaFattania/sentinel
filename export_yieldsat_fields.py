@@ -75,17 +75,21 @@ def export_field(ds, idx, band_indices, raw, destination, meta):
     dates = field_dates(ds, idx)
     t = x.shape[1]
     n_s2, n_weather = len(S2), len(WEATHER)
-    static = x[:, 0, n_s2 + n_weather:]
+    static = x[:, 0, n_s2 + n_weather :]
     # Static data are repeated in the source. Allow the first slot to be missing.
     for slot in range(1, t):
         missing = ~np.isfinite(static)
         if not missing.any():
             break
-        static[missing] = x[:, slot, n_s2 + n_weather:][missing]
-    weather_values = x[:, :, n_s2:n_s2 + n_weather]
+        static[missing] = x[:, slot, n_s2 + n_weather :][missing]
+    weather_values = x[:, :, n_s2 : n_s2 + n_weather]
     count = np.isfinite(weather_values).sum(axis=0)
-    weather = np.divide(np.nansum(weather_values, axis=0), count,
-                        out=np.full(count.shape, np.nan, np.float32), where=count > 0)
+    weather = np.divide(
+        np.nansum(weather_values, axis=0),
+        count,
+        out=np.full(count.shape, np.nan, np.float32),
+        where=count > 0,
+    )
     s2 = np.full((t, n_s2, *shape), np.nan, np.float32)
     s2[:, :, rows, cols] = x[:, :, :n_s2].transpose(1, 2, 0)
     grids = np.full((static.shape[1], *shape), np.nan, np.float32)
@@ -107,14 +111,27 @@ def export_field(ds, idx, band_indices, raw, destination, meta):
     centers = month_start + (month_end - month_start) // 2
 
     destination.mkdir(parents=True)
-    for name, array in dict(s2=s2, weather=weather, dem=dem, soil=soil, coord=coord,
-                            dates=dates, slot_dates=centers, season=season, mask=mask, yield_=ymap).items():
+    for name, array in dict(
+        s2=s2,
+        weather=weather,
+        dem=dem,
+        soil=soil,
+        coord=coord,
+        dates=dates,
+        slot_dates=centers,
+        season=season,
+        mask=mask,
+        yield_=ymap,
+    ).items():
         np.save(destination / ("yield.npy" if name == "yield_" else f"{name}.npy"), array)
     meta["s2_reference"] = str(reference.resolve())
     meta["yield_pixels_excluded_raw_nodata"] = dropped
     meta["bands"] = dict(s2=S2, weather=WEATHER, dem=DEM, soil=SOIL, coord=COORD)
     (destination / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    print(f"{raw.name}: {shape}, labeled={np.isfinite(y).sum()}, optical dates={(~np.isnat(dates)).sum()}", flush=True)
+    print(
+        f"{raw.name}: {shape}, labeled={np.isfinite(y).sum()}, optical dates={(~np.isnat(dates)).sum()}",
+        flush=True,
+    )
 
 
 def main():
@@ -157,7 +174,11 @@ def main():
                 try:
                     metadata = raw / f"metadata-{name}.json"
                     meta = json.loads(metadata.read_text(encoding="utf-8"))
-                    selection = slice(int(idx[0]), int(idx[-1]) + 1) if idx[-1] - idx[0] + 1 == len(idx) else idx
+                    selection = (
+                        slice(int(idx[0]), int(idx[-1]) + 1)
+                        if idx[-1] - idx[0] + 1 == len(idx)
+                        else idx
+                    )
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     with TemporaryDirectory(prefix=".field-", dir=dest.parent) as tmp:
                         staged = Path(tmp) / name

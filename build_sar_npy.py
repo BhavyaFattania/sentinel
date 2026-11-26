@@ -6,6 +6,7 @@ Warped directly to the field's matching raw S2 reference grid from coreg_pairs.c
 
 python build_sar_npy.py --npy npy --pairs YieldSAT_Project/data/coreg_pairs.csv --log YieldSAT_Project/data/local_export_log.csv --map "F:\\YieldSAT_Project=$PWD/YieldSAT_Project" --map "F:\\Raw=$PWD/Raw" --max-fields 2
 """
+
 import os, re, glob, argparse, datetime as dt
 from pathlib import Path
 import numpy as np, pandas as pd, rasterio
@@ -14,34 +15,52 @@ from rasterio.enums import Resampling
 
 RE = re.compile(r"(\d{8})T\d{6}")
 
+
 def remap(p, win, lin):
     """F:\\YieldSAT_Project\\x -> /linux/root/x (Windows paths stored in the CSVs)"""
     p = str(p).replace("\\", "/")
     w = win.replace("\\", "/").rstrip("/")
-    return lin.rstrip("/") + p[len(w):] if p.lower().startswith(w.lower()) else p
+    return lin.rstrip("/") + p[len(w) :] if p.lower().startswith(w.lower()) else p
+
 
 def s1_date(i):
     m = RE.search(str(i))
     return np.datetime64(dt.datetime.strptime(m.group(1), "%Y%m%d").date()) if m else None
 
+
 def load_s1(path, grid):
-    with rasterio.open(path) as src, WarpedVRT(
-        src, **grid, dtype="float32", nodata=np.nan, resampling=Resampling.nearest
-    ) as aligned:
+    with (
+        rasterio.open(path) as src,
+        WarpedVRT(
+            src, **grid, dtype="float32", nodata=np.nan, resampling=Resampling.nearest
+        ) as aligned,
+    ):
         return aligned.read([1, 2], masked=True).filled(np.nan)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--npy", required=True); ap.add_argument("--pairs", required=True)
-    ap.add_argument("--log", required=True); ap.add_argument("--sigma", type=float, default=10)
+    ap.add_argument("--npy", required=True)
+    ap.add_argument("--pairs", required=True)
+    ap.add_argument("--log", required=True)
+    ap.add_argument("--sigma", type=float, default=10)
     ap.add_argument("--max-fields", type=int, default=None)
     ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument("--name", default="sar.npy", help="output file name, e.g. sar_s3.npy for sigma=3")
-    ap.add_argument("--map", action="append", default=[],
-                    help='Windows=Linux prefix remap, repeatable, e.g. --map "F:\\YieldSAT_Project=/home/u/YieldSAT_Project" --map "F:\\Raw=/home/u/Raw"')
-    ap.add_argument("--path-column", default="local_path", help="column containing the TIFFs to use")
-    ap.add_argument("--input-db", action="store_true", help="combine GEE dB inputs in power before returning dB")
+    ap.add_argument(
+        "--name", default="sar.npy", help="output file name, e.g. sar_s3.npy for sigma=3"
+    )
+    ap.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        help='Windows=Linux prefix remap, repeatable, e.g. --map "F:\\YieldSAT_Project=/home/u/YieldSAT_Project" --map "F:\\Raw=/home/u/Raw"',
+    )
+    ap.add_argument(
+        "--path-column", default="local_path", help="column containing the TIFFs to use"
+    )
+    ap.add_argument(
+        "--input-db", action="store_true", help="combine GEE dB inputs in power before returning dB"
+    )
     a = ap.parse_args()
     if not np.isfinite(a.sigma) or a.sigma <= 0:
         ap.error("--sigma must be finite and positive")
@@ -49,9 +68,12 @@ def main():
     pairs = pd.read_csv(a.pairs).set_index("field_id")["s2_matched_path"].to_dict()
     log = pd.read_csv(a.log)
     maps = [m.split("=", 1) for m in a.map]
+
     def rm(p):
-        for w, l in maps: p = remap(p, w, l)
+        for w, l in maps:
+            p = remap(p, w, l)
         return p
+
     pairs = {k: rm(v) for k, v in pairs.items()}
     log = log.dropna(subset=[a.path_column]).copy()
     log[a.path_column] = log[a.path_column].map(rm)
@@ -62,10 +84,13 @@ def main():
     for d in sorted(glob.glob(os.path.join(a.npy, "*", "*"))):
         f = os.path.basename(d)
         out = os.path.join(d, a.name)
-        if (os.path.exists(out) and not a.overwrite) or not os.path.exists(os.path.join(d, "dates.npy")):
+        if (os.path.exists(out) and not a.overwrite) or not os.path.exists(
+            os.path.join(d, "dates.npy")
+        ):
             continue
         if f not in by_field or f not in pairs:
-            print("skip (no SAR/ref):", f); continue
+            print("skip (no SAR/ref):", f)
+            continue
         field = Path(d)
         shape = np.load(field / "mask.npy").shape
         slots = np.load(field / "dates.npy").astype("datetime64[D]")
@@ -76,7 +101,9 @@ def main():
             slots = np.where(np.load(field / "season.npy"), slots, np.datetime64("NaT", "D"))
         with rasterio.open(pairs[f]) as ref:
             if ref.shape != shape:
-                raise ValueError(f"{f}: reference shape {ref.shape} differs from exported mask {shape}")
+                raise ValueError(
+                    f"{f}: reference shape {ref.shape} differs from exported mask {shape}"
+                )
             grid = dict(crs=ref.crs, transform=ref.transform, height=ref.height, width=ref.width)
         g = by_field[f]
         stack = np.stack([load_s1(p, grid) for p in g[a.path_column]])
@@ -96,9 +123,12 @@ def main():
         np.save(temp, comp)
         temp.replace(out)
         done += 1
-        print(f"[{done}] {f} sar {comp.shape} from {len(g)} images, nan={np.isnan(comp).mean():.3f}")
+        print(
+            f"[{done}] {f} sar {comp.shape} from {len(g)} images, nan={np.isnan(comp).mean():.3f}"
+        )
         if a.max_fields and done >= a.max_fields:
             break
+
 
 if __name__ == "__main__":
     main()

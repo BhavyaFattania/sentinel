@@ -49,20 +49,23 @@ def multitemporal_filter(collection, band, window=5):
     temporal mean is not corrupted by geometry-driven backscatter shifts.
     """
     kernel = ee.Kernel.square(radius=window // 2, units="pixels")
+
     def _power_and_local_mean(img):
         db = img.select(band)
         power = db.multiply(math.log(10) / 10).exp()
         mean = power.reduceNeighborhood(reducer=ee.Reducer.mean(), kernel=kernel)
-        return img.addBands(mean.rename("_local_mean")).addBands(power.divide(mean).rename("_ratio"))
+        return img.addBands(mean.rename("_local_mean")).addBands(
+            power.divide(mean).rename("_ratio")
+        )
 
     normalized = collection.map(_power_and_local_mean)
     temporal_ratio = normalized.select("_ratio").mean()
 
     def _filter_one(img):
         db = img.select("_local_mean").multiply(temporal_ratio).log10().multiply(10)
-        return img.addBands(
-            db.rename(band + "_mtfilt"), overwrite=True
-        ).select(img.bandNames().remove("_local_mean").remove("_ratio").add(band + "_mtfilt"))
+        return img.addBands(db.rename(band + "_mtfilt"), overwrite=True).select(
+            img.bandNames().remove("_local_mean").remove("_ratio").add(band + "_mtfilt")
+        )
 
     return normalized.map(_filter_one)
 
@@ -95,6 +98,7 @@ def log_submitted(field_id, image_id, task_id, path=SUBMITTED_LOG):
 # Target grid (read from an existing Sentinel-2 GeoTIFF)
 # ============================================================
 from rasterio.warp import transform_bounds
+
 
 # ============================================================
 # Target grid (read from an existing Sentinel-2 GeoTIFF)
@@ -147,8 +151,17 @@ def wait_for_queue_capacity(threshold=2800, poll_interval_seconds=180):
 
 
 def export_image(
-    img, bands, field_id, image_id, country, crs_wkt, transform, bounds_wgs84, folder,
-    retry_wait_seconds=120, submitted_log=SUBMITTED_LOG,
+    img,
+    bands,
+    field_id,
+    image_id,
+    country,
+    crs_wkt,
+    transform,
+    bounds_wgs84,
+    folder,
+    retry_wait_seconds=120,
+    submitted_log=SUBMITTED_LOG,
 ):
     """
     Export the given bands together as one multi-band GeoTIFF, reprojected
@@ -196,20 +209,25 @@ def export_image(
             raise  # a real error (bad CRS, missing asset, etc.) â€” don't retry, surface it
 
 
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ee-project", required=True, help="Earth Engine-enabled Google Cloud project")
-    parser.add_argument("--data-dir", default=DATA_DIR, help="directory containing the scene inventory CSVs")
-    parser.add_argument("--mt-window", type=int, default=5, help="Speckle filter kernel size (pixels)")
+    parser.add_argument(
+        "--ee-project", required=True, help="Earth Engine-enabled Google Cloud project"
+    )
+    parser.add_argument(
+        "--data-dir", default=DATA_DIR, help="directory containing the scene inventory CSVs"
+    )
+    parser.add_argument(
+        "--mt-window", type=int, default=5, help="Speckle filter kernel size (pixels)"
+    )
     parser.add_argument("--drive-folder", type=str, default="YieldSAT_S1_exports")
     parser.add_argument(
         "--max-new-tasks",
         type=int,
         default=2500,
         help="Stop submitting new tasks after this many in one run, to stay under GEE's "
-             "3000-task queue cap (leaves headroom for tasks still draining). "
-             "Rerun the script later to continue where it left off.",
+        "3000-task queue cap (leaves headroom for tasks still draining). "
+        "Rerun the script later to continue where it left off.",
     )
     args = parser.parse_args()
 
@@ -224,7 +242,9 @@ def main():
 
     already_submitted = load_submitted_set(submitted_log)
     if already_submitted:
-        print(f"Resuming: {len(already_submitted)} image(s) already submitted in a previous run â€” will skip those.")
+        print(
+            f"Resuming: {len(already_submitted)} image(s) already submitted in a previous run â€” will skip those."
+        )
         print()
 
     print("Checking current Earth Engine queue size before starting...")
@@ -250,8 +270,10 @@ def main():
         ):
             if len(geom_group) < 3:
                 # Multi-temporal filtering needs a minimum stack size to be useful.
-                print(f"  orbit {rel_orbit} ({orbit_dir}): "
-                      f"only {len(geom_group)} scenes, skipping (need >= 3)")
+                print(
+                    f"  orbit {rel_orbit} ({orbit_dir}): "
+                    f"only {len(geom_group)} scenes, skipping (need >= 3)"
+                )
                 continue
 
             image_ids = geom_group["gee_system_index"].tolist()
@@ -262,9 +284,7 @@ def main():
             filtered = multitemporal_filter(collection, band="VV", window=args.mt_window)
             filtered = multitemporal_filter(filtered, band="VH", window=args.mt_window)
 
-            ref_matches = field_scene_map.loc[
-                field_scene_map["field_id"] == field_id
-            ]
+            ref_matches = field_scene_map.loc[field_scene_map["field_id"] == field_id]
             if ref_matches.empty or "s2_grid_ref_path" not in ref_matches.columns:
                 print(f"  no s2_grid_ref_path found in field_scene_map.csv, skipping")
                 continue

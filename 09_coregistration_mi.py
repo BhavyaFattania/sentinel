@@ -188,7 +188,8 @@ def estimate_shift_mi(s1_arr, s2_arr, max_shift=15, bins=32, peak_exclusion_radi
     # Second-best MI among candidates far enough from the winner to count
     # as a genuinely different location, not just its immediate neighbour.
     far_candidates = [
-        mi for (dy, dx), (mi, _) in surface.items()
+        mi
+        for (dy, dx), (mi, _) in surface.items()
         if max(abs(dy - best_dy), abs(dx - best_dx)) > peak_exclusion_radius
     ]
     second_best_mi = max(far_candidates) if far_candidates else best_mi
@@ -212,25 +213,40 @@ def apply_shift_and_write(s1_path, out_path, shift_y, shift_x):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pairs-file", type=str, default=COREG_PAIRS)
-    parser.add_argument("--max-shift", type=int, default=15,
-                         help="Search range in pixels (+/-) — keep small, this is O(max_shift^2)")
+    parser.add_argument(
+        "--max-shift",
+        type=int,
+        default=15,
+        help="Search range in pixels (+/-) — keep small, this is O(max_shift^2)",
+    )
     parser.add_argument("--bins", type=int, default=32, help="Histogram bins for MI estimation")
-    parser.add_argument("--use-gradient", action="store_true",
-                         help="Use gradient magnitude (Sobel) instead of raw intensity — "
-                              "often more robust cross-modally (Ye et al., 2017)")
-    parser.add_argument("--improvement-threshold", type=float, default=0.05,
-                         help="Minimum fractional MI improvement over zero-shift to trust "
-                              "and auto-apply the correction")
-    parser.add_argument("--sharpness-threshold", type=float, default=1.05,
-                         help="Minimum peak_sharpness (best_MI / second_best_MI at a genuinely "
-                              "different candidate shift) to trust the match. Catches two false-"
-                              "positive modes MI Gain alone misses: (1) a flat/noisy MI surface "
-                              "where many unrelated shifts score nearly as well as the 'winner' "
-                              "— the reported shift is then essentially arbitrary even if its "
-                              "gain over zero-shift looks fine; (2) a small field with too little "
-                              "content for a reliable histogram, where MI can look inflated by "
-                              "chance. Default 1.05 requires the peak to be at least 5%% better "
-                              "than any distinct alternative.")
+    parser.add_argument(
+        "--use-gradient",
+        action="store_true",
+        help="Use gradient magnitude (Sobel) instead of raw intensity — "
+        "often more robust cross-modally (Ye et al., 2017)",
+    )
+    parser.add_argument(
+        "--improvement-threshold",
+        type=float,
+        default=0.05,
+        help="Minimum fractional MI improvement over zero-shift to trust "
+        "and auto-apply the correction",
+    )
+    parser.add_argument(
+        "--sharpness-threshold",
+        type=float,
+        default=1.05,
+        help="Minimum peak_sharpness (best_MI / second_best_MI at a genuinely "
+        "different candidate shift) to trust the match. Catches two false-"
+        "positive modes MI Gain alone misses: (1) a flat/noisy MI surface "
+        "where many unrelated shifts score nearly as well as the 'winner' "
+        "— the reported shift is then essentially arbitrary even if its "
+        "gain over zero-shift looks fine; (2) a small field with too little "
+        "content for a reliable histogram, where MI can look inflated by "
+        "chance. Default 1.05 requires the peak to be at least 5%% better "
+        "than any distinct alternative.",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -255,15 +271,23 @@ def main():
                 s1_p, s2_p, max_shift=args.max_shift, bins=args.bins
             )
 
-            improvement = (mi - mi_zero) / abs(mi_zero) if mi_zero and mi_zero != 0 else float("inf")
+            improvement = (
+                (mi - mi_zero) / abs(mi_zero) if mi_zero and mi_zero != 0 else float("inf")
+            )
             # A match is only trustworthy if BOTH hold: (1) meaningfully better than doing
             # nothing (MI gain), AND (2) a genuinely distinct peak, not one of many similarly
             # -scoring candidates (sharpness). Either alone can be misleading — see the two
             # false-positive modes documented on --sharpness-threshold below.
-            confident = improvement >= args.improvement_threshold and sharpness >= args.sharpness_threshold
+            confident = (
+                improvement >= args.improvement_threshold and sharpness >= args.sharpness_threshold
+            )
             shift_mag_m = np.hypot(dy, dx) * pixel_size
-            flag = "ok" if confident else (
-                "low_sharpness" if sharpness < args.sharpness_threshold else "low_improvement"
+            flag = (
+                "ok"
+                if confident
+                else (
+                    "low_sharpness" if sharpness < args.sharpness_threshold else "low_improvement"
+                )
             )
             if abs(dy) >= args.max_shift or abs(dx) >= args.max_shift:
                 flag = "hit_search_boundary_review"
@@ -274,23 +298,41 @@ def main():
                 apply_shift_and_write(row["s1_export_path"], corrected_path, dy, dx)
                 applied = True
 
-            print(f"shift=({dy},{dx})px (~{shift_mag_m:.1f}m) NMI={nmi:.4f} "
-                  f"MI_gain={improvement:.2%} sharpness={sharpness:.2f}x flag={flag}")
+            print(
+                f"shift=({dy},{dx})px (~{shift_mag_m:.1f}m) NMI={nmi:.4f} "
+                f"MI_gain={improvement:.2%} sharpness={sharpness:.2f}x flag={flag}"
+            )
 
-            results.append({
-                "field_id": field_id, "shift_y_px": dy, "shift_x_px": dx,
-                "shift_magnitude_m": shift_mag_m, "mi": mi, "nmi": nmi,
-                "mi_improvement_pct": improvement, "peak_sharpness": sharpness,
-                "correction_applied": applied, "flag": flag,
-            })
+            results.append(
+                {
+                    "field_id": field_id,
+                    "shift_y_px": dy,
+                    "shift_x_px": dx,
+                    "shift_magnitude_m": shift_mag_m,
+                    "mi": mi,
+                    "nmi": nmi,
+                    "mi_improvement_pct": improvement,
+                    "peak_sharpness": sharpness,
+                    "correction_applied": applied,
+                    "flag": flag,
+                }
+            )
         except Exception as e:
             print(f"FAILED ({e})")
-            results.append({
-                "field_id": field_id, "shift_y_px": None, "shift_x_px": None,
-                "shift_magnitude_m": None, "mi": None, "nmi": None,
-                "mi_improvement_pct": None, "peak_sharpness": None,
-                "correction_applied": False, "flag": "failed",
-            })
+            results.append(
+                {
+                    "field_id": field_id,
+                    "shift_y_px": None,
+                    "shift_x_px": None,
+                    "shift_magnitude_m": None,
+                    "mi": None,
+                    "nmi": None,
+                    "mi_improvement_pct": None,
+                    "peak_sharpness": None,
+                    "correction_applied": False,
+                    "flag": "failed",
+                }
+            )
 
     log_df = pd.DataFrame(results)
     log_df.to_csv(COREG_LOG, index=False)
@@ -303,7 +345,9 @@ def main():
     print(f"Corrections applied           : {int(log_df['correction_applied'].sum())}")
     print(f"Low improvement (unfixed)     : {(log_df['flag'] == 'low_improvement').sum()}")
     print(f"Low sharpness / ambiguous peak: {(log_df['flag'] == 'low_sharpness').sum()}")
-    print(f"Hit search boundary (review)  : {(log_df['flag'] == 'hit_search_boundary_review').sum()}")
+    print(
+        f"Hit search boundary (review)  : {(log_df['flag'] == 'hit_search_boundary_review').sum()}"
+    )
     print(f"Failed                        : {(log_df['flag'] == 'failed').sum()}")
     print(f"Written to                    : {COREG_LOG}")
     print("=" * 60)

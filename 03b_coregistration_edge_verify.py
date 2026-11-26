@@ -181,30 +181,38 @@ def estimate_shift_edge(s1_path, s2_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--ncc-threshold", type=float, default=0.15,
+        "--ncc-threshold",
+        type=float,
+        default=0.15,
         help="Min acceptable manual NCC (normalized cross-correlation, -1..1) "
-             "to flag a field as 'confident'. NCC is more interpretable than "
-             "skimage's phase-correlation error for sparse edge maps — 0.15-0.2 "
-             "is a reasonable starting bar; tune after inspecting a few fields.",
+        "to flag a field as 'confident'. NCC is more interpretable than "
+        "skimage's phase-correlation error for sparse edge maps — 0.15-0.2 "
+        "is a reasonable starting bar; tune after inspecting a few fields.",
     )
     parser.add_argument(
-        "--pairs-file", type=str, default=COREG_PAIRS,
+        "--pairs-file",
+        type=str,
+        default=COREG_PAIRS,
         help="CSV with field_id, s1_export_path, s2_matched_path columns "
-             "(output of 08_prepare_coregistration_pairs.py by default)",
+        "(output of 08_prepare_coregistration_pairs.py by default)",
     )
     parser.add_argument(
-        "--compare-log", type=str, default=None,
+        "--compare-log",
+        type=str,
+        default=None,
         help="Optional: path to the intensity-based coregistration_log.csv, "
-             "to print a side-by-side comparison at the end.",
+        "to print a side-by-side comparison at the end.",
     )
     parser.add_argument(
-        "--diagnose-n", type=int, default=0,
+        "--diagnose-n",
+        type=int,
+        default=0,
         help="If >0, print raw array/edge-map statistics (min/max/mean/std/"
-             "nonzero-fraction) for the first N pairs before scoring anything. "
-             "Use this if results still look degenerate (e.g. all errors "
-             "identical) — it tells you whether the edge maps themselves are "
-             "sane or whether something upstream (units, all-zero tiles, "
-             "band selection) is degenerate.",
+        "nonzero-fraction) for the first N pairs before scoring anything. "
+        "Use this if results still look degenerate (e.g. all errors "
+        "identical) — it tells you whether the edge maps themselves are "
+        "sane or whether something upstream (units, all-zero tiles, "
+        "band selection) is degenerate.",
     )
     args = parser.parse_args()
 
@@ -218,12 +226,18 @@ def main():
                 s1_arr, s2_arr, _, _ = read_overlap(row["s1_export_path"], row["s2_matched_path"])
                 s1_e = edge_map(s1_arr)
                 s2_e = edge_map(s2_arr)
-                for label, a in [("S1 raw", s1_arr), ("S2 raw", s2_arr),
-                                  ("S1 edges", s1_e), ("S2 edges", s2_e)]:
-                    print(f"  {row['field_id']:45s} {label:9s} "
-                          f"shape={a.shape} min={np.nanmin(a):.4g} max={np.nanmax(a):.4g} "
-                          f"mean={np.nanmean(a):.4g} std={np.nanstd(a):.4g} "
-                          f"nonzero_frac={np.mean(a != 0):.3f}")
+                for label, a in [
+                    ("S1 raw", s1_arr),
+                    ("S2 raw", s2_arr),
+                    ("S1 edges", s1_e),
+                    ("S2 edges", s2_e),
+                ]:
+                    print(
+                        f"  {row['field_id']:45s} {label:9s} "
+                        f"shape={a.shape} min={np.nanmin(a):.4g} max={np.nanmax(a):.4g} "
+                        f"mean={np.nanmean(a):.4g} std={np.nanstd(a):.4g} "
+                        f"nonzero_frac={np.mean(a != 0):.3f}"
+                    )
             except Exception as e:
                 print(f"  {row['field_id']}: DIAGNOSTIC FAILED ({e})")
         print("=" * 60)
@@ -247,10 +261,16 @@ def main():
             shift_y, shift_x, error, ncc, transform = estimate_shift_edge(s1_path, s2_path)
         except Exception as e:
             print(f"FAILED ({e})")
-            results.append({
-                "field_id": field_id, "shift_y_px": None, "shift_x_px": None,
-                "error": None, "ncc": None, "flag": "failed",
-            })
+            results.append(
+                {
+                    "field_id": field_id,
+                    "shift_y_px": None,
+                    "shift_x_px": None,
+                    "error": None,
+                    "ncc": None,
+                    "flag": "failed",
+                }
+            )
             continue
 
         pixel_size = abs(transform.a)
@@ -263,16 +283,18 @@ def main():
             f"(~{shift_mag_px * pixel_size:.1f} m), error={error:.3f}, ncc={ncc:.3f}, flag={flag}"
         )
 
-        results.append({
-            "field_id": field_id,
-            "shift_y_px": shift_y,
-            "shift_x_px": shift_x,
-            "shift_magnitude_px": shift_mag_px,
-            "shift_magnitude_m": shift_mag_px * pixel_size,
-            "error": error,
-            "ncc": ncc,
-            "flag": flag,
-        })
+        results.append(
+            {
+                "field_id": field_id,
+                "shift_y_px": shift_y,
+                "shift_x_px": shift_x,
+                "shift_magnitude_px": shift_mag_px,
+                "shift_magnitude_m": shift_mag_px * pixel_size,
+                "error": error,
+                "ncc": ncc,
+                "flag": flag,
+            }
+        )
 
     log_df = pd.DataFrame(results)
     log_df.to_csv(EDGE_COREG_LOG, index=False)
@@ -305,10 +327,13 @@ def main():
         intensity_df = pd.read_csv(args.compare_log)
         merged = log_df.merge(
             intensity_df[["field_id", "error", "flag"]],
-            on="field_id", suffixes=("_edge", "_intensity"),
+            on="field_id",
+            suffixes=("_edge", "_intensity"),
         )
-        print(f"Fields improved from low_confidence -> ok using edges: "
-              f"{((merged['flag_intensity'] == 'low_confidence') & (merged['flag_edge'] == 'ok')).sum()}")
+        print(
+            f"Fields improved from low_confidence -> ok using edges: "
+            f"{((merged['flag_intensity'] == 'low_confidence') & (merged['flag_edge'] == 'ok')).sum()}"
+        )
         print("Mean error, intensity-based :", intensity_df["error"].mean())
         print("Mean error, edge-based      :", log_df["error"].mean())
     print("=" * 60)

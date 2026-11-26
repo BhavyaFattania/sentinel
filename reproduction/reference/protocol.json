@@ -1,0 +1,34 @@
+{
+  "commit": "17ad3801a3b12d3b6d4f03914b88ad712ce8d947",
+  "manifest_sha256": "55435256359f380d6fd6f0ebe5ebef0d9b060173c68c891f3907222b264ec643",
+  "countries": [
+    "Argentina",
+    "Brazil"
+  ],
+  "region": "country/provider/farm",
+  "outer_folds": 27,
+  "fields": 263,
+  "model_variants": {
+    "aff_lstm2": [
+      2,
+      false
+    ],
+    "aff_lstm1": [
+      1,
+      false
+    ],
+    "aff_lstm1_valid_pool": [
+      1,
+      true
+    ]
+  },
+  "samples_per_epoch": 24576,
+  "batch": 256,
+  "max_epochs": 10,
+  "lr": 0.001,
+  "training_sampler": "equal pixel draws per training farm",
+  "validation": "two separate Argentine farms and one separate Brazilian farm; at most 1024 pixels per field",
+  "pick": "lowest validation mean-farm RMSE; min 5 epochs, patience 3, min improvement 0.015",
+  "test": "all labeled pixels in held-out farms",
+  "seeds": "42 plus outer fold index"
+}

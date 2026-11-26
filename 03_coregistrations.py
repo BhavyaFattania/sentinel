@@ -50,7 +50,9 @@ def read_overlap(s1_path, s2_path, band=1):
     """
     with rasterio.open(s1_path) as s1_src, rasterio.open(s2_path) as s2_src:
         if s1_src.crs != s2_src.crs:
-            raise ValueError(f"CRS mismatch: {s1_src.crs} vs {s2_src.crs} — not comparable directly.")
+            raise ValueError(
+                f"CRS mismatch: {s1_src.crs} vs {s2_src.crs} — not comparable directly."
+            )
 
         # Intersection of the two rasters' real-world bounds.
         left = max(s1_src.bounds.left, s2_src.bounds.left)
@@ -105,11 +107,15 @@ def estimate_shift(s1_path, s2_path, debug=False):
         raise ValueError("Overlapping window is empty after cropping — check raster bounds/CRS.")
 
     if debug:
+
         def stats(name, arr):
-            print(f"    {name}: shape={arr.shape} dtype={arr.dtype} "
-                  f"min={np.nanmin(arr):.4g} max={np.nanmax(arr):.4g} "
-                  f"mean={np.nanmean(arr):.4g} std={np.nanstd(arr):.4g} "
-                  f"nan_count={np.isnan(arr).sum()}")
+            print(
+                f"    {name}: shape={arr.shape} dtype={arr.dtype} "
+                f"min={np.nanmin(arr):.4g} max={np.nanmax(arr):.4g} "
+                f"mean={np.nanmean(arr):.4g} std={np.nanstd(arr):.4g} "
+                f"nan_count={np.isnan(arr).sum()}"
+            )
+
         stats("S1 raw", s1_arr)
         stats("S2 raw", s2_arr)
 
@@ -153,15 +159,15 @@ def main():
         type=str,
         default=COREG_PAIRS,
         help="CSV with field_id, s1_export_path, s2_matched_path columns "
-             "(output of 08_prepare_coregistration_pairs.py by default)",
+        "(output of 08_prepare_coregistration_pairs.py by default)",
     )
     parser.add_argument(
         "--debug-stats",
         type=int,
         default=0,
         help="Print raw/normalised array statistics for the first N fields, "
-             "then stop — use this to diagnose degenerate arrays (e.g. all-NaN, "
-             "constant) before running the full batch.",
+        "then stop — use this to diagnose degenerate arrays (e.g. all-NaN, "
+        "constant) before running the full batch.",
     )
     args = parser.parse_args()
 
@@ -172,7 +178,9 @@ def main():
     pairs = pd.read_csv(args.pairs_file)  # must include s1_export_path, s2_matched_path
 
     if args.debug_stats:
-        print(f"DEBUG MODE — printing array stats for the first {args.debug_stats} fields, then stopping.")
+        print(
+            f"DEBUG MODE — printing array stats for the first {args.debug_stats} fields, then stopping."
+        )
         print()
         for idx, row in pairs.head(args.debug_stats).iterrows():
             print(f"[{row['field_id']}]")
